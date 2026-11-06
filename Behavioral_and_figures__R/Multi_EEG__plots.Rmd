@@ -1,0 +1,1679 @@
+---
+title: "Multi EEG"
+author: "Davide Gheza"
+date: "2025-03-07"
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+# Analysis scope
+
+This notebook imports MATLAB decoding, RSA, and encoding exports; computes the
+reported time-series cluster tests; and assembles EEG panels for main Figures
+4--6 and SI Figures S2--S4. Chunk labels and export file names refer to the
+current figure numbering; exports are loaded by file name (`read_export`).
+
+```{r Import data, echo=FALSE, results="hide"}
+## Import MATLAB exports
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(R.matlab, ggpubr, dplyr, tidyr, reshape2, viridis, permuco, ggh4x) 
+
+
+if(.Platform$OS.type == "unix") {
+data_dir <- ("/Users/davidegheza/Library/CloudStorage/OneDrive-Personal/Documenti/MATLAB/dg_workspace22/dimensions/analyses/scripts_and_settings/reported/export_to_R/")
+} else {
+data_dir <- ("C:/Users/gdavide/OneDrive/Documenti/MATLAB/dg_workspace22/dimensions/analyses/scripts_and_settings/reported/export_to_R/") 
+}
+
+
+times = seq(-800, 1498, by = 10)
+
+read_and_extract_data <- function(file) {
+    data=readMat(file)
+    subfield_name = names(data)[1] # Assuming there is always only one subfield
+    data = data[[subfield_name]]
+    data = data[, , 1]
+    return(data)
+}
+
+# Load a MATLAB export from data_dir by file name (without .mat)
+read_export <- function(name) read_and_extract_data(file.path(data_dir, paste0(name, ".mat")))
+
+# Shared plot settings.
+fontsize <- 14
+fontsize2 <- 16
+Labels = c('Color', 'Shape', 'Edge', 'Pattern')
+PC_names_full = c('Neu1', 'MI', 'MC', 'Neu2')
+PC_names = c('NeuAVG', 'MI', 'MC')
+
+
+
+### Cluster-permutation support
+
+# Interleave observed time series with their null value for `permuco` tests
+# following the Maris-Oostenveld cluster-mass framework.
+dat_matrix = function(ts,zero_level) { # specify timeseries (sbj by time) and chance level
+  ts = data.frame(ts)
+  colnames(ts) = times
+  zeros_matrix = data.frame(matrix(zero_level, nrow = nrow(ts), ncol = ncol(ts)))
+  colnames(zeros_matrix) = colnames(ts) 
+  ts = ts %>%     # interleave observations and null-value rows
+          mutate(row_number = row_number(),
+          var = 1) %>%
+          bind_rows(zeros_matrix %>%
+          mutate(row_number = row_number(),
+                 var = 2)) %>%
+          arrange(row_number, var) %>%
+    mutate(
+      row_number = NULL,
+      var = NULL
+    ) %>% data.matrix()
+  return(ts)
+}
+```
+
+```{r Fig_4, echo=FALSE, results="hide"}
+# Final Figure 4B-D: decoding accuracy and model-1 RSA
+
+# Figure 4B: multiclass decoding accuracy.
+class_acc_list = read_export("Fig4_classification_accuracy")
+names = names(class_acc_list)
+# Convert the 4D array to a long dataframe
+lda_acc = class_acc_list[["group.lda.cond.acc"]] # [[ ]] to extract array from a list
+num_conditions <- dim(lda_acc)[3]
+condition_names <- c("Left Color", "Left Shape", "Left Edge", "Left Pattern", "Right Color", "Right Shape", "Right Edge", "Right Pattern")
+
+plot_data <- data.frame()
+for (co in 1:num_conditions) {
+  temp_data <- data.frame(
+    time = times,
+    accuracy = apply(lda_acc[,,co,], 3, function(x) mean(x, na.rm = TRUE)) * 100,
+    condition = condition_names[co]
+  )
+  plot_data <- rbind(plot_data, temp_data)
+}
+plot_data$side <- ifelse(grepl("^Left", plot_data$condition), "Left", "Right")
+plot_data$condition <- factor(plot_data$condition, levels = condition_names)
+plot_data$dimension <- factor(gsub( ".* ", "", plot_data$condition ), levels = c("Color", "Shape", "Edge", "Pattern"))
+
+
+# Plot
+x1 = ggplot(plot_data, aes(x = time, y = accuracy, color = dimension, linetype = side)) +
+  geom_line(linewidth = 1) +
+  scale_color_viridis(discrete = T, name = "Dimension") +
+  scale_alpha_manual(values = c("Left" = 1, "Right" = 0.5)) +
+  geom_hline(yintercept = 12.5, linetype = "dotted") + # Reference line at 12.5%
+  geom_vline(xintercept = -200, linetype = "dotted") +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  coord_cartesian(clip = "off", ylim = c(10, 25)) +
+  annotate("text", x = -200, y = 7.5, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'Accuracy (%)', color = 'Dimension', linetype = 'Side') +
+  ggtitle('Group-average LDA accuracy') +
+  theme_minimal(base_size = fontsize) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  ) 
+x1
+ggsave(plot = x1, width = 6, height = 4, dpi = 300, filename = "f4_LDA_accuracy.pdf")
+
+
+
+# Figure 4C: task, spatial-attention, and feature-coding RSA estimates.
+rsa_m1_list = read_export("Fig4_m1_RSA_betas")
+names = names(rsa_m1_list)
+# plot M1 cued dimension - across PCs - SR, cue, dim-general side
+fits_sr = rsa_m1_list[[names[1]]]
+fits_ru = rsa_m1_list[[names[2]]]
+fits_si = rsa_m1_list[[names[3]]]
+# Convert the 4D array to a long dataframe
+mean_sr <- apply(fits_sr, 3, mean) # mean over 1st and 2nd dims (sbj and PC)
+mean_ru <- apply(fits_ru, 3, mean)
+mean_si <- apply(fits_si, 3, mean)
+
+sem_sr <- apply(fits_sr, 3, sd) / sqrt(dim(fits_sr)[1])
+sem_ru <- apply(fits_ru, 3, sd) / sqrt(dim(fits_ru)[1])
+sem_si <- apply(fits_si, 3, sd) / sqrt(dim(fits_si)[1])
+
+df_sr <- data.frame(
+  times = times,
+  value = mean_sr,
+  sem = sem_sr,
+  type = 'SR'
+)
+df_ru <- data.frame(
+  times = times,
+  value = mean_ru,
+  sem = sem_ru,
+  type = 'RU'
+)
+df_si <- data.frame(
+  times = times,
+  value = mean_si,
+  sem = sem_si,
+  type = 'SI'
+)
+rsa_m1_df <- rbind(df_sr, df_ru, df_si)
+rsa_m1_df$type <- as.factor(rsa_m1_df$type)
+
+
+# Plot
+colors <- c(
+  rgb(255, 0, 0, maxColorValue = 255),# red
+  rgb(255, 192, 0, maxColorValue = 255),# yellow
+  rgb(0, 112, 192, maxColorValue = 255) # blue
+)
+ylims <- c(-0.1, 1.0)
+x2 = rsa_m1_df %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = type), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = type), size = 1) +
+  scale_fill_manual(values = colors) +
+  scale_color_manual(values = colors) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = ylims) +
+  annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  theme(
+    legend.position = 'northwest',
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x2 
+ggsave(plot = x2, width = 6, height = 4, dpi = 300, filename = "f4_m1_RSA_cued.pdf")
+
+
+# Figure 4D: dimension-resolved RSA estimates and RT distributions.
+rsa_m1_bydim_list = read_export("Fig4_m1_RSA_betas_bydim_bst0")
+names = names(rsa_m1_bydim_list)
+# function to process each model (SR, RU, SI)
+process_array_4d <- function(data_list, array_name, labels, model_names) {    # 4d array: sbjs, pc, time, task/distractor
+  array <- data_list[[array_name]]
+  mean_values <- apply(array, c(3, 4), mean) # over the 1st and 2nd dimensions (sbj and PC)
+  sem_values <- apply(array, c(3, 4), sd) / sqrt(dim(array)[1])
+  colnames(mean_values) <- labels
+  colnames(sem_values) <- labels
+  mean_df <- as.data.frame(mean_values)
+  sem_df <- as.data.frame(sem_values)
+  mean_df$t = seq.int(nrow(mean_df))
+  mean_df$times = times
+  sem_df$t = seq.int(nrow(mean_df))
+  mean_long <- mean_df %>% pivot_longer(cols = all_of(labels), names_to = "Dimension", values_to = "value")
+  sem_long <- sem_df %>% pivot_longer(cols = all_of(labels), names_to = "Dimension", values_to = "sem")
+  result_long <- mean_long %>%    # Combine mean and SEM into a single data frame
+    left_join(sem_long, by = c("Dimension","t"))
+  result_long$Dimension <- factor(result_long$Dimension, levels = Labels)
+  result_long$model <- substr(array_name, 6, nchar(array_name)) %>% factor(levels = model_names)
+  
+  return(result_long)
+}
+# apply function
+model_names = c(substr(names[1], 6, nchar(names[1])),
+                substr(names[2], 6, nchar(names[2])), 
+                substr(names[3], 6, nchar(names[3])))
+df_sr <- process_array_4d(rsa_m1_bydim_list, names[1], Labels, model_names)
+df_ru <- process_array_4d(rsa_m1_bydim_list, names[2], Labels, model_names)
+df_si <- process_array_4d(rsa_m1_bydim_list, names[3], Labels, model_names)
+df_allmodels <- rbind(df_sr,df_ru,df_si) 
+
+# plot, each model to one subplot, and 4th subplot for RT distribution
+ylims <- c(-0.1, 0.8)
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("Cue\nonset", "", ""),
+  x     = c(-200, 0, 0),
+  y     = c(-0.35, 0, 0)
+)
+x3 = df_allmodels %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = Dimension), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = Dimension), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Dimension") +
+  scale_color_viridis(discrete = T, name = "Dimension") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = ylims) +
+  # annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(model ~ .) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label)
+) +
+  theme(
+    legend.position = "none", 
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x3 
+# prepare RT distribution plot (first get data_proc from Multi_EEG_PC)
+x3_rt = data_proc %>%
+  filter(correct==1) %>%
+  mutate(task = factor(task, levels = c(1,3,2,4),labels = Labels[order(c(1,3,2,4))] )) %>% # reorder levels so "edge" is behind "shape"
+  ggplot(aes(rt, fill = task, color = task)) +
+  geom_histogram(position = "identity", binwidth = 20, alpha = 0.6, color = "black") +
+  theme_minimal(base_size = fontsize) +
+  labs(title = "", # Reaction Time Distribution by Dimension
+       x = "Reaction Time (ms)",
+       y = "Frequency") +
+  scale_fill_viridis_d(name = "Task dimension", limits = Labels) + # limits allows to force the order in the legend only ...
+  scale_color_viridis_d(name = "Task dimension", limits = Labels) + # this is important for maintaing the color mapping
+  scale_x_continuous(limits = range(-800, 1490), expand = c(0, 0)) +
+  theme(
+    legend.position = c(0.05, 0.95), # Position legend in the top right corner within the plot
+    legend.justification = c("left", "top"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5))
+x3_rt
+x3_combo = ggpubr::ggarrange(x3_rt, x3, ncol = 1, nrow = 2, heights = c(0.5, 1))
+x3_combo
+ggsave(plot = x3_combo, width =  4.724, height = 8, dpi = 300, filename = "f4_m1_RSA_cued_bydim.pdf")
+
+
+```
+
+
+```{r notreported_m2, echo=FALSE, results="hide", eval=FALSE}
+# Unreported model-2 diagnostic plots retained for provenance
+# all models - ru, si, sr, and non-cued ru (average)
+rsa_m2_list = read_export("notreported_m2_RSA_betas")
+names = names(rsa_m2_list)
+# function to process each model (SR, RU, SI, RU distractors average)
+process_array_3d <- function(data_list, array_name) {
+  array <- data_list[[array_name]]
+  mean_values <- apply(array, c(3), mean) # over the 1st and 2nd dimensions (sbj and PC) - i.e., apply over times, to keep
+  sem_values <- apply(array, c(3), sd) / sqrt(dim(array)[1])
+  df <- data.frame(
+            times = times,
+            value = mean_values,
+            sem = sem_values,
+            model = substr(array_name, 6, nchar(array_name)) %>% factor(levels = c("ru", "si", "sr", "ru.dstr")) # levels specification is just to set order
+          )
+  
+  return(df)
+}
+# apply function
+df_sr <- process_array_3d(rsa_m2_list, names[1])
+df_ru <- process_array_3d(rsa_m2_list, names[2])
+df_si <- process_array_3d(rsa_m2_list, names[3])
+df_ru_dstr <- process_array_3d(rsa_m2_list, names[4])
+
+df_allmodels_m2 <- rbind(df_sr,df_ru,df_si,df_ru_dstr) 
+
+# Plot
+colors <- c(
+  rgb(255, 0, 0, maxColorValue = 255),# red
+  rgb(255, 192, 0, maxColorValue = 255),# yellow
+  rgb(0, 112, 192, maxColorValue = 255), # blue
+  rgb(0, 0, 0, maxColorValue = 255) # black
+)
+ylims <- c(-0.1, 1.0)
+x4 = df_allmodels_m2 %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = model), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = model), size = 1) +
+  scale_fill_manual(values = colors) +
+  scale_color_manual(values = colors) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = ylims) +
+  annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  theme(
+    legend.position = 'northwest',
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x4 
+ggsave(plot = x4, width = 6, height = 4, dpi = 300, filename = "fS1_m2_RSA_all.pdf")
+
+
+#################################### Panel 2 ######################################
+# non-cued rule by dimension
+rsa_m2_bydim_list = read_export("notreported_m2_RSA_betas_bydim")
+names = names(rsa_m2_bydim_list)
+# apply function (re-use function from x3)
+model_names = c(substr(names[1], 6, nchar(names[1])),
+                substr(names[2], 6, nchar(names[2])))
+df_ru <- process_array_4d(rsa_m2_bydim_list, names[1], Labels, model_names)
+df_ru_dstr <- process_array_4d(rsa_m2_bydim_list, names[2], Labels, model_names)
+df_allmodels_m2_bydim <- rbind(df_ru,df_ru_dstr) 
+# plot, each model to one subplot, and 4th subplot for RT distribution
+ylims <- c(-0.6, 0.75)
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("", "Cue\nonset"),
+  x     = c(0, -200),
+  y     = c(0, -0.85)
+)
+x5 = df_allmodels_m2_bydim %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = Dimension), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = Dimension), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Dimension") +
+  scale_color_viridis(discrete = T, name = "Dimension") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = ylims) +
+  # annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(model ~ .) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label)
+) +
+  theme(
+    legend.position = "none", 
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x5
+ggsave(plot = x5, width = 6, height = 6, dpi = 300, filename = "fS1_m2_RSA_rules_cued_noncued.pdf")
+
+
+#################################### Panel 3 ######################################
+# non-cued rule by single-distractor and cued dimension
+rsa_m2_bydim_list = read_export("notreported_m2_RSA_betas_bydim")
+names = names(rsa_m2_bydim_list)
+# function to process each model (just ru_dist here) when including each distractor and each cued task
+process_array_5d <- function(data_list, array_name, labels, model_names) {    # 5d array: sbjs, pc, time, distractor, task
+  array <- data_list[[array_name]]
+  mean_values <- apply(array, c(3, 4, 5), mean) # over the 1st and 2nd dimensions (sbj and PC)
+  sem_values <- apply(array, c(3, 4, 5), sd) / sqrt(dim(array)[1])
+  df1 <- as.data.frame.table(mean_values, responseName="value")
+  df2 <- as.data.frame.table(sem_values, responseName="sem")
+  df <- left_join(df1,df2, by = c("Var1","Var2","Var3"))
+  names(df) <- c("times", "distractor", "task", "value", "sem")
+  df$times = times
+  df$distractor = factor(df$distractor, labels = Labels)
+  df$task = factor(df$task, labels=Labels)
+  df$model <- substr(array_name, 6, nchar(array_name)) %>% factor(levels = model_names)
+  
+  return(df)
+}
+# apply function
+model_names = c(substr(names[3], 6, nchar(names[3])))
+df_ru_dstr_bytask <- process_array_5d(rsa_m2_bydim_list, names[3], Labels, model_names)
+# plot, each task to one subplot
+ylims <- c(-0.6, 0.4)
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("","","", "Cue\nonset"),
+  x     = c(0,0,0, -200),
+  y     = c(0,0,0, -0.85)
+)
+x6 = df_ru_dstr_bytask %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = distractor), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = distractor), size = 1) +
+  scale_fill_viridis(discrete = T, name = "distractor") +
+  scale_color_viridis(discrete = T, name = "distractor") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = ylims) +
+  # annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(task ~ .) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label)
+) +
+  theme(
+    legend.position = "none", 
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x6
+ggsave(plot = x6, width = 6, height = 6, dpi = 300, filename = "fS1_m2_RSA_rules_noncued_distbytask.pdf")
+
+
+
+
+
+# colors <- scales::seq_gradient_pal("blue", "green")(seq(0, 1, length.out = 4))
+
+```
+
+
+```{r Fig_5, echo=FALSE, results="hide"}
+# Final Figure 5B-C: model-3 cued and distractor representations
+
+# Figure 5B: cued and average distractor conjunction representations.
+rsa_m3_list = read_export("Fig5_Fig6_m3_RSA_betas")
+names = names(rsa_m3_list)
+# function to process each model (SR, SR distractors average)
+process_array_3d <- function(data_list, array_name) {
+    array <- data_list[[array_name]]
+    mean_values <- apply(array, c(3), mean) # over the 1st and 2nd dimensions (sbj and PC) - i.e., apply over times, to keep
+    sem_values <- apply(array, c(3), sd) / sqrt(dim(array)[1])
+    df <- data.frame(
+        times = times,
+        value = mean_values,
+        sem = sem_values,
+        model = substr(array_name, 6, nchar(array_name)) %>% factor(levels = c("sr", "sr.dstr")) # levels specification is just to set order
+    )
+  
+  
+  df <- data.frame(
+            times = times,
+            value = mean_values,
+            sem = sem_values,
+            model = substr(array_name, 6, nchar(array_name)) %>% factor(levels = c("sr", "sr.dstr")) # levels specification is just to set order
+          )
+  
+  return(df)
+}
+# apply function
+df_sr <- process_array_3d(rsa_m3_list, names[1])
+df_sr_dstr <- process_array_3d(rsa_m3_list, names[2])
+
+df_allmodels_m3 <- rbind(df_sr,df_sr_dstr) 
+
+
+# compute cluster-based permutation analysis 
+# (Maris & Oostenveld, 2007 - package from Frossard: github.com/jaromilfrossard/permuco)
+p_x = 0.05 # critical p threshold for cluster selection
+# First define function to prepare data matrix
+dat_matrix = function(ts,zero_level) { # specify timeseries (sbj by time) and chance level
+  ts = data.frame(ts)
+  colnames(ts) = times
+  zeros_matrix = data.frame(matrix(zero_level, nrow = nrow(ts), ncol = ncol(ts)))
+  colnames(zeros_matrix) = colnames(ts) 
+  ts = ts %>%     # interleave observations and null-value rows
+          mutate(row_number = row_number(),
+          var = 1) %>%
+          bind_rows(zeros_matrix %>%
+          mutate(row_number = row_number(),
+                 var = 2)) %>%
+          arrange(row_number, var) %>%
+    mutate(
+      row_number = NULL,
+      var = NULL
+    ) %>% data.matrix()
+  return(ts)
+}
+# prepare data matrix (sbj by times) for permuco
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+sr = apply(rsa_m3_list$fits.sr, c(1, 3), mean) # average over PC (preserve dim sbjs)
+sr = dat_matrix(sr,zero_level)
+sr_dstr = apply(rsa_m3_list$fits.sr.dstr, c(1, 3), mean) 
+sr_dstr = dat_matrix(sr_dstr,zero_level)
+
+# prepare design for permuco (data frame for the independent variables)
+design_m3 = data.frame(sub_id = rep(1:26,2), var = c(rep(1,26),c(rep(0,26)) )) %>% arrange(sub_id, desc(var))
+# run cluster mass permutation test
+sr_cmt = clusterlm(sr ~ var,              # cluster mass test for sr 
+                   data = design_m3,
+                   np = 5000,
+                   test = "fisher",
+                   p_scale = TRUE,
+                   threshold = 0.95) # Cluster-forming threshold
+plot(sr_cmt)
+sr_sum = summary(sr_cmt, 'two.sided')
+sr_cluster = c(sr_sum$var[[1]],sr_sum$var[[2]])
+
+sr_dstr_cmt = clusterlm(sr_dstr ~ var,
+                   data = design_m3,
+                   np = 5000,
+                   test = "fisher",
+                   p_scale = TRUE,
+                   threshold = 0.95) # Cluster-forming threshold
+plot(sr_dstr_cmt)
+sr_dstr_sum = summary(sr_dstr_cmt, 'two.sided')
+sr_dstr_sum = data.frame(sr_dstr_sum$var)
+sr_dstr_cluster = sr_dstr_sum[ (sr_dstr_sum$P..mass. < p_x),]
+
+
+# Plot
+significant_clusters <- data.frame(
+  start = c(times[sr_cluster[1]], times[sr_dstr_cluster$start]), 
+  end = c(times[sr_cluster[2]], times[sr_dstr_cluster$end]), 
+  offsets = c(-0.06, -0.04),
+  model = c("sr", "sr.dstr")
+)
+colors <- c(
+  rgb(0, 0, 0, maxColorValue = 255), # black
+  rgb(0, 112, 192, maxColorValue = 255) # blue
+  )
+ylims <- c(-0.05, 0.60)
+x7 = df_allmodels_m3 %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = model), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = model, linetype = model), size = 1) +
+  scale_fill_manual(values = colors) +
+  scale_color_manual(values = colors) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = ylims) +
+  annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  theme(
+    legend.position = 'northwest',
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x7 = x7 + # adding significant cluster bars
+  geom_segment(data = significant_clusters, aes(x = start, xend = end, 
+                                                y = offsets, yend = offsets, color = model), size = 4) +
+  scale_color_manual(values = colors) 
+x7 
+ggsave(plot = x7, width = 6, height = 6, dpi = 300, filename = "f5_m3_RSA_conjunction_cued_noncued.pdf")
+
+
+# Figure 5C: representations resolved by cued or distractor dimension.
+# cued conjunction by cued dimension, non-cued conjuction by distractor dimension
+rsa_m3_bydim_list = read_export("Fig5_m3_RSA_betas_bydim_bst0") # includes cued and non-cued conjunction by dim - NOTE: by dim refers to CUED dim (if cued) or DISTRACTOR dim (if non-cued)
+names = names(rsa_m3_bydim_list)
+# apply function (re-use function from x3)
+model_names = c(substr(names[1], 6, nchar(names[1])),
+                substr(names[2], 6, nchar(names[2])))
+df_sr <- process_array_4d(rsa_m3_bydim_list, names[1], Labels, model_names)
+df_sr_dstr <- process_array_4d(rsa_m3_bydim_list, names[2], Labels, model_names)
+df_allmodels_m3_bydim <- rbind(df_sr,df_sr_dstr) 
+# plot, each model to one subplot
+# ylims <- c(-0.05, 0.75)
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("", "\n\n\nCue\nonset"),
+  x     = c(0, -200),
+  y     = c(0, -0.05)
+)
+x8 = df_allmodels_m3_bydim %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = Dimension), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = Dimension, linetype = model), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Dimension") +
+  scale_color_viridis(discrete = T, name = "Dimension") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off") + # , ylim = ylims
+  # annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(model ~ ., scales="free") +
+  scale_linetype_manual(values = c('solid','dashed'),guide = "none") +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label)
+) +
+  theme(
+    legend.position = "none", 
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x8
+
+# add cluster stat bars
+offset = c(-0.02, -0.03, -0.04, -0.05)
+# prepare data matrix (sbj by times) for permuco. Design is same as for distractor average (subid, var=data vs 0)
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+sr_singledstr = apply(rsa_m3_bydim_list$fits.sr.singledstr, c(1, 3, 4), mean) # average over PC (preserve dim sbjs, time, distractor)
+sr_sdtr_cluster = data.frame()
+p_x = 0.05 # critical p threshold for cluster selection
+for (sdtr in 1:4){
+  dstr_mx = dat_matrix(sr_singledstr[,,sdtr],zero_level)
+  # run cluster mass permutation test
+  sdtr_cmt = clusterlm(dstr_mx ~ var,              # cluster mass test for sr 
+                     data = design_m3,
+                     np = 5000,
+                     test = "fisher",
+                     p_scale = TRUE,
+                     threshold = 0.95) # Cluster-forming threshold
+  plot(sdtr_cmt)
+  sdtr_sum = summary(sdtr_cmt, 'two.sided')
+  sdtr_sum = data.frame(sdtr_sum$var)
+  sig_clusters = sdtr_sum[ (sdtr_sum$P..mass. < p_x),]
+  sig_clusters$Dimension = Labels[sdtr]
+  sig_clusters$offset = offset[sdtr]
+  sig_clusters$model = factor('sr.singledstr') # to add error bar selectively to second facet
+  sr_sdtr_cluster = rbind(sr_sdtr_cluster, sig_clusters)
+}
+
+x8 = x8 + # adding significant cluster bars
+  geom_segment(data = sr_sdtr_cluster, aes(x =  times[start], xend = times[end], 
+                                                y = offset, yend = offset, 
+                                                color = Dimension), size = 3)
+
+ggsave(plot = x8, width = 6, height = 6, dpi = 300, filename = "f5_m3_RSA_conjunction_cued_noncued_bydim.pdf")
+
+```
+
+
+```{r Fig_5_SFig2_SFig3_CSE, echo=FALSE, results="hide"}
+# Final Figure 5E-G, SI Figures S2 (RSA) and S3 (encoding): congruency-sequence effects
+np_iters = 20000 # permutations for cluster-based permutation tests (20000 for stable results)
+
+CSE_source = "m3"
+# choose source files for CSE: RSA m3, encoding dim-shared, encoding dim-private (former: SR QRdim)
+if (CSE_source == "m3"){
+rsa_CSE_list = read_export("Fig5_SFig2_CSE_m3_RSA_betas")  # includes adaptation effects on non-cued conjunction
+names = names(rsa_CSE_list)
+file_modifier = paste0("f5_",CSE_source)
+y_axis_title_modifier = "RSA beta"
+x_set = c(-200)
+y_set = c(-0.06)
+x_set2 = c(-200)
+y_set2 = c(-0.08)
+x_set3 = c(-200)
+y_set3 = c(-0.26)
+x_set4 = c(0, -200)
+y_set4 = c(0, -0.02)
+offset_set = c(-0.04, -0.045, -0.05, -0.055)
+offset_set2 = c(-0.08, -0.085)
+offset_set3 = c(-0.222, -0.230, -0.238, -0.246)
+bar_size = 3
+pdf_size = c(6,5)
+fontsize = 14
+legend_text_size = 12
+} else if (CSE_source == "enc_si"){
+rsa_CSE_list = read_export("SFig3_CSE_encoding_dimGen")
+names = names(rsa_CSE_list)
+file_modifier = paste0("sf3_",CSE_source)
+y_axis_title_modifier = "Encoding beta"
+x_set = c(-200)
+y_set = c(-0.065)
+x_set2 = c(-200)
+y_set2 = c(-0.080)
+x_set3 = c(-200)
+y_set3 = c(-0.212)
+x_set4 = c(0, -200)
+y_set4 = c(0, -0.16)
+offset_set = c(-0.045, -0.050, -0.055, -0.060)# cluster test bars location: parametric cng
+offset_set2 = c(-0.085, -0.090)# .. adaptation on / off diagonal
+offset_set3 = c(-0.195, -0.200, -0.205, -0.210)# .. on diagonal by dimension
+bar_size = 4 # larger size for encoding betas to fit differnet y scale
+pdf_size = c(4.5,4.5)
+fontsize = 15
+legend_text_size = 11
+} else if (CSE_source == "enc_sr"){
+rsa_CSE_list = read_export("SFig3_CSE_encoding_dimSpec")
+names = names(rsa_CSE_list)
+file_modifier = paste0("sf3_",CSE_source)
+y_axis_title_modifier = "Encoding beta"
+x_set = c(-200)
+y_set = c(-0.065)
+x_set2 = c(-200)
+y_set2 = c(-0.080)
+x_set3 = c(-200)
+y_set3 = c(-0.212)
+x_set4 = c(0, -200)
+y_set4 = c(0, -0.16)
+offset_set = c(-0.045, -0.050, -0.055, -0.060)# cluster test bars location: parametric cng
+offset_set2 = c(-0.085, -0.090)# .. adaptation on / off diagonal
+offset_set3 = c(-0.195, -0.200, -0.205, -0.210)# .. on diagonal by dimension
+bar_size = 4 # larger size for encoding betas to fit differnet y scale
+pdf_size = c(4.5,4.5)
+fontsize = 15
+legend_text_size = 11
+} else if (CSE_source == "enc_DSC"){
+rsa_CSE_list = read_export("notreported_CSE_encoding_DSC")
+names = names(rsa_CSE_list)
+file_modifier = paste0("sf3_",CSE_source)
+y_axis_title_modifier = "Encoding beta"
+x_set = c(-200)
+y_set = c(-0.095)
+x_set2 = c(-200)
+y_set2 = c(-0.13)
+x_set3 = c(-200)
+y_set3 = c(-0.225)
+x_set4 = c(0, -200)
+y_set4 = c(0, -0.16)
+offset_set = c(-0.075, -0.080, -0.085, -0.090)# cluster test bars location: parametric cng
+offset_set2 = c(-0.125, -0.130)# .. adaptation on / off diagonal
+offset_set3 = c(-0.255, -0.260, -0.265, -0.270)# .. on diagonal by dimension
+bar_size = 4 # larger size for encoding betas to fit differnet y scale
+pdf_size = c(6,5)
+fontsize = 15
+legend_text_size = 11
+}
+  
+# prepare design for permuco (data frame for the independent variables)
+design_CSE = data.frame(sub_id = rep(1:26,2), var = c(rep(1,26),c(rep(0,26)) )) %>% arrange(sub_id, desc(var))
+
+# function to process CSE data (from matlab - 3-dimensional). E.g., param data: previous sum con: 4   times: 230    sbj: 26
+process_array_cse_param <- function(data_list, array_name, labels, model_names) {   
+  array <- data_list[[array_name]]
+  array <- aperm(array, c(3,2,1)) # transpose: 26  230  4
+  mean_values <- apply(array, c(2,3), mean) # over the 1st and 2nd dimensions - i.e., apply over times and prev_sum_con, to keep
+  sem_values <- apply(array, c(2,3), sd) / sqrt(dim(array)[1])
+  colnames(mean_values) <- labels
+  colnames(sem_values) <- labels
+  mean_df <- as.data.frame(mean_values)
+  sem_df <- as.data.frame(sem_values)
+  mean_df$t = seq.int(nrow(mean_df))
+  mean_df$times <- times
+  sem_df$t <- seq.int(nrow(mean_df))
+  mean_long <- mean_df %>% pivot_longer(cols = all_of(labels), names_to = "line_var", values_to = "value")
+  sem_long <- sem_df %>% pivot_longer(cols = all_of(labels), names_to = "line_var", values_to = "sem")
+  result_long <- mean_long %>%    # Combine mean and SEM into a single data frame
+    left_join(sem_long, by = c("line_var","t"))
+  result_long$line_var <- factor(result_long$line_var, levels = labels)
+  result_long$model <- substr(array_name, 4, nchar(array_name)) %>% factor(levels = model_names)
+  
+  return(result_long)
+}
+
+
+
+
+#################################### Panel 1 ######################################
+# CSE_param_noncued_bydim
+cse_labels=c('0','1','2','3')
+model_names = c(substr(names[4], 4, nchar(names[4]))) # kept just for flexibility if function is reused for multi-plot panel
+df_cse_param <- process_array_cse_param(rsa_CSE_list, names[4], cse_labels, model_names) # apply function
+
+# plot 
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("\n\n\n\n\nCue\nonset"),
+  x     = x_set,
+  y     = y_set
+)
+x9 = df_cse_param %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = line_var), alpha = 0.4) +
+  geom_line(aes(x = times, y = value, color = line_var), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Number previous\ncongruent dimensions",
+                      begin = 0.7,
+                      end = 1,
+                      option="turbo") +
+  scale_color_viridis(discrete = T, name = "Number previous\ncongruent dimensions",
+                      begin = 0.7,
+                      end = 1,
+                      option="turbo") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off") + # , ylim = ylims
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'Encoding beta') +
+  theme_minimal(base_size = fontsize) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label),
+  size = 4 # in pts. Conversion: fontsize / 2.845.
+) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.85, 0.85),
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_text(size = legend_text_size),
+    legend.text = element_text(size = legend_text_size),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x9
+
+# add cluster stat bars
+offset = offset_set
+# prepare data matrix (sbj by times) for permuco. Design is same as for distractor average (subid, var=data vs 0)
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+m3_cse_param = aperm(rsa_CSE_list[[grep("adaptations\\.param$", names(rsa_CSE_list), value=TRUE)[1]]], c(3,2,1)) # transpose: 26  230  4
+cse_param_cluster = data.frame()
+p_x = 0.05 # critical p threshold for cluster selection
+for (tests in 1:4){
+  dstr_mx = dat_matrix(m3_cse_param[,,tests],zero_level)
+  # run cluster mass permutation test
+  cmt = clusterlm(dstr_mx ~ var,              # cluster mass test for sr 
+                     data = design_CSE,
+                     np = np_iters,
+                     test = "fisher",
+                     p_scale = TRUE,
+                     threshold = 0.95) # Cluster-forming threshold
+  plot(cmt)
+  cmt_sum = summary(cmt,
+                    alternative = "two.sided")# note: here (parametric effect) we test for either direction
+  cmt_sum = data.frame(cmt_sum$var)
+  sig_clusters = cmt_sum[ (cmt_sum$P..mass. < p_x),]
+  if (length(sig_clusters$cluster.mass)>0){
+    sig_clusters$line_var = cse_labels[tests]
+    sig_clusters$offset = offset[tests]
+    cse_param_cluster = rbind(cse_param_cluster, sig_clusters)
+  }
+}
+
+if(nrow(cse_param_cluster) != 0){ # add bars only if they exist (any sig cluster)
+  x9 = x9 + # adding significant cluster bars
+    geom_segment(data = cse_param_cluster, aes(x =  times[start], xend = times[end], 
+                                                  y = offset, yend = offset, 
+                                                  color = line_var), size = bar_size,
+                                                  show.legend = FALSE)
+}
+ggsave(plot = x9, width = pdf_size[1], height = pdf_size[2], dpi = 300, filename = paste0(file_modifier,"_CSE_param_noncued.pdf"))
+
+
+
+
+
+
+
+
+
+#################################### Panel 2 ######################################
+# CSE: adaptation on / off diagonal 
+cse_labels=c('On','Off')
+cse_relabels=c('Within-dimension','Across-dimension')
+model_names = c(substr(names[1], 4, nchar(names[1]))) # kept just for flexibility if function is reused for multi-plot panel
+df_cse_onoff <- process_array_cse_param(rsa_CSE_list, names[1], cse_labels, model_names) # apply function (on/off diagonal: 2   230    26)
+
+# plot 
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("\n\n\n\n\nCue\nonset"),
+  x     = x_set2,
+  y     = y_set2
+)
+x10 = df_cse_onoff %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = line_var), alpha = 0.4) +
+  geom_line(aes(x = times, y = value, color = line_var), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Sequence type", 
+                     begin = 0.1,
+                     end = 0.4,
+                     option="plasma",
+                     labels = cse_relabels) +
+  scale_color_viridis(discrete = T, name = "Sequence type", 
+                     begin = 0.1,
+                     end = 0.4,
+                     option="plasma",
+                     labels = cse_relabels) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off") + # , ylim = ylims
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = bquote(atop(Delta ~ .(y_axis_title_modifier), "(previous incongruent – previous congruent)")) ) +
+  theme_minimal(base_size = fontsize) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label),
+  size = 4 # in pts. Conversion: fontsize / 2.845.
+) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.8, 0.2),
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_text(size = legend_text_size),
+    legend.text = element_text(size = legend_text_size),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x10
+
+# add cluster stat bars
+offset = offset_set2
+# prepare data matrix (sbj by times) for permuco. Design is same as for distractor average (subid, var=data vs 0)
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+m3_cse_onoff = aperm(rsa_CSE_list[[grep("adaptations$", names(rsa_CSE_list), value=TRUE)[1]]], c(3,2,1)) # transpose: 26  230  2
+cse_onoff_cluster = data.frame()
+p_x = 0.05 # critical p threshold for cluster selection
+for (tests in 1:2){
+  dstr_mx = dat_matrix(m3_cse_onoff[,,tests],zero_level)
+  # run cluster mass permutation test
+  cmt = clusterlm(dstr_mx ~ var,              # cluster mass test for sr 
+                     data = design_CSE,
+                     np = np_iters,
+                     test = "t",
+                     p_scale = TRUE,
+                     threshold = 0.95) # Cluster-forming threshold
+  plot(cmt)
+  cmt_sum = summary(cmt,
+                    alternative = "less")#"two.sided",#greater
+  cmt_sum = data.frame(cmt_sum$var)
+  sig_clusters = cmt_sum[ (cmt_sum$P..mass. < p_x),]
+  if (length(sig_clusters$cluster.mass)>0){
+    sig_clusters$line_var = cse_labels[tests]
+    sig_clusters$offset = offset[tests]
+    cse_onoff_cluster = rbind(cse_onoff_cluster, sig_clusters)
+  }
+}
+
+if(nrow(cse_onoff_cluster) != 0){ # add bars only if they exist (any sig cluster)
+x10 = x10 + # adding significant cluster bars
+  geom_segment(data = cse_onoff_cluster, aes(x =  times[start], xend = times[end], 
+                                                y = offset, yend = offset, 
+                                                color = line_var), size = bar_size,
+                                                show.legend = FALSE)
+}
+ggsave(plot = x10, width = pdf_size[1], height = pdf_size[2], dpi = 300, filename = paste0(file_modifier,"_CSE_onoff.pdf"))
+
+
+
+
+
+
+
+
+#################################### Panel 3 ######################################
+# CSE: adaptation on diagonal by dimension
+cse_labels=Labels
+model_names = c(substr(names[2], 4, nchar(names[2]))) # kept just for flexibility if function is reused for multi-plot panel
+df_cse_bydim <- process_array_cse_param(rsa_CSE_list, names[2], cse_labels, model_names) # apply function (on diagonal by distractor: 4 230 26)
+
+# plot 
+dat_text <- data.frame(
+  model   = model_names,
+  label    = c("\n\n\n\n\nCue\nonset"),
+  x     = x_set3,
+  y     = y_set3
+)
+x11 = df_cse_bydim %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = line_var), alpha = 0.4) +
+  geom_line(aes(x = times, y = value, color = line_var), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Non-cued dimension") +
+  scale_color_viridis(discrete = T, name = "Non-cued dimension") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off") + # , ylim = ylims
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = bquote(atop(Delta ~ .(y_axis_title_modifier), "(previous incongruent – previous congruent)")) ) +
+  theme_minimal(base_size = fontsize) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label),
+  size = 4 # in pts. Conversion: fontsize / 2.845.
+) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.85, 0.2),
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_text(size = legend_text_size),
+    legend.text = element_text(size = legend_text_size),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x11
+
+# add cluster stat bars
+offset = offset_set3
+# prepare data matrix (sbj by times) for permuco. Design is same as for distractor average (subid, var=data vs 0)
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+m3_cse_onbydim = aperm(rsa_CSE_list[[grep("adaptations\\.on.bydist$", names(rsa_CSE_list), value=TRUE)[1]]], c(3,2,1)) # transpose: 26  230  4
+cse_onbydim_cluster = data.frame()
+p_x = 0.05 # critical p threshold for cluster selection
+for (tests in 1:4){
+  dstr_mx = dat_matrix(m3_cse_onbydim[,,tests],zero_level)
+  # run cluster mass permutation test
+  cmt = clusterlm(dstr_mx ~ var,              # cluster mass test for sr 
+                     data = design_CSE,
+                     np = np_iters,
+                     test = "t",
+                     p_scale = TRUE,
+                     threshold = 0.95) # Cluster-forming threshold
+  plot(cmt)
+  cmt_sum = summary(cmt,
+                    alternative = "less")#"two.sided",#greater
+  cmt_sum = data.frame(cmt_sum$var)
+  sig_clusters = cmt_sum[ (cmt_sum$P..mass. < p_x),]
+  if (length(sig_clusters$cluster.mass)>0){
+    sig_clusters$line_var = cse_labels[tests]
+    sig_clusters$offset = offset[tests]
+    cse_onbydim_cluster = rbind(cse_onbydim_cluster, sig_clusters)
+  }
+}
+
+if(nrow(cse_onoff_cluster) != 0){ # add bars only if they exist (any sig cluster)
+  x11 = x11 + # adding significant cluster bars
+    geom_segment(data = cse_onbydim_cluster, aes(x =  times[start], xend = times[end], 
+                                                  y = offset, yend = offset, 
+                                                  color = line_var), size = bar_size,
+                                                  show.legend = FALSE)
+}
+
+ggsave(plot = x11, width = pdf_size[1], height = pdf_size[2], dpi = 300, filename = paste0(file_modifier,"_CSE_on_bydim.pdf"))
+
+
+
+
+
+
+
+
+
+
+#################################### Panel 4 ######################################
+prevcng_labels = c("Incongruent","Congruent")
+on_off_labels = c("On","Off")
+# function to process single-condition CSE data (from matlab - 4-dimensional). (prev cng, on/off, time, sbj: 2 2 230 26)
+process_array_cse_single <- function(data_list, array_name, labels_1, labels_2, model_names) {   
+  array <- data_list[[array_name]]
+  array <- aperm(array, c(4,3,1,2))                               # transpose: 26  230  2 (prev cng) 2 (on/off)
+  mean_values <- apply(array, c(2,3,4), mean) # over the 1st and 2nd dimensions - i.e., apply over times and prev_sum_con, to keep
+  sem_values <- apply(array, c(2,3,4), sd) / sqrt(dim(array)[1])
+  df1 <- as.data.frame.table(mean_values, responseName="value")
+  df2 <- as.data.frame.table(sem_values, responseName="sem")
+  df <- left_join(df1,df2, by = c("Var1","Var2","Var3"))
+  names(df) <- c("times", "prev_cng", "line_var", "value", "sem")
+  df$times = times
+  df$prev_cng = factor(df$prev_cng, labels = labels_1)
+  df$line_var = factor(df$line_var, labels=labels_2)
+  df$model <- substr(array_name, 1, nchar(array_name)) %>% factor(levels = model_names)
+  
+  return(df)
+}
+# CSE: on / off diagonal by previous cng - single conditions  (prev cng, on/off, time, sbj: 2 2 230 26)
+cse_relabels=c('Within-dimension','Across-dimension')
+prev_cng_labels=c("Incongruent"="Previous incongruent","Congruent"="Previous congruent")
+model_names = c(substr(names[5], 1, nchar(names[5]))) # kept just for flexibility if function is reused for multi-plot panel
+df_cse_single <- process_array_cse_single(rsa_CSE_list, names[5], 
+                                          prevcng_labels, on_off_labels, model_names) # apply function (on/off diagonal: 2   230    26)
+
+# plot 
+dat_text <- data.frame(
+  prev_cng = factor(prevcng_labels),
+  label    = c("", "\n\n\n\n\nCue\nonset"),
+  x     = x_set4,
+  y     = y_set4
+)
+x12 = df_cse_single %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = line_var), alpha = 0.4) +
+  geom_line(aes(x = times, y = value, color = line_var), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Sequence type", 
+                     begin = 0.1,
+                     end = 0.4,
+                     option="plasma",
+                     labels = cse_relabels) +
+  scale_color_viridis(discrete = T, name = "Sequence type", 
+                     begin = 0.1,
+                     end = 0.4,
+                     option="plasma",
+                     labels = cse_relabels) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off", ylim = c(-0.03,0.07)) + # 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = y_axis_title_modifier) +
+  facet_grid(prev_cng ~ ., scales="fixed", labeller = labeller(prev_cng = prev_cng_labels)) +
+  theme_minimal(base_size = fontsize) +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label),
+  size = 4 # in pts. Conversion: fontsize / 2.845.
+) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.8, 0.4),
+    strip.background = element_blank(), 
+    legend.title = element_text(size = legend_text_size),
+    legend.text = element_text(size = legend_text_size),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x12
+
+
+ggsave(plot = x12, width = pdf_size[1], height = pdf_size[2], dpi = 300, filename = paste0(file_modifier,"_CSE_onoff_byprevCNG.pdf"))
+
+
+```
+
+
+```{r SFig3_basic_SFig4_resplocked, echo=FALSE, results="hide"}
+# SI Figures S3-S4: stimulus- and response-locked encoding projections
+
+library(ggh4x) # to set independent y-axis limits per facet panel 
+
+np_iters = 20000 # permutations for cluster-based permutation tests (20000 for stable results)
+
+source = "enc_sr"
+response_locked = TRUE # for sf4
+# choose source files: encoding dim-general vs. encoding dim-specific (aka shared vs private)
+# note: cued projection by cued dimension, non-cued projection by distractor dimension
+if (source == "enc_si"){
+enc_list = if (!response_locked) {read_export("SFig3_basic_encoding_dimGen_bst0")} else {read_export("SFig4_resplocked_encoding_dimGen_bst0")}
+names = names(enc_list)
+file_modifier = if (!response_locked) {paste0("sf3_",source)} else {paste0("sf4_",source)}
+ylims_cued = if (!response_locked) {c(-0.07, 0.45)} else {c(-0.07, 0.85)}
+ylims_dstr = c(-0.10, 0.10)
+y_offset = -0.10
+offset = c(-0.061, -0.072, -0.083, -0.094) 
+fontsize = 15
+} else if (source == "enc_sr"){
+enc_list = if (!response_locked) {read_export("SFig3_basic_encoding_dimSpec_bst0")} else {read_export("SFig4_resplocked_encoding_dimSpec_bst0")}
+names = names(enc_list)
+file_modifier = if (!response_locked) {paste0("sf3_",source)} else {paste0("sf4_",source)}
+ylims_cued = if (!response_locked) {c(-0.07, 0.45)} else {c(-0.07, 0.85)}
+ylims_dstr = c(-0.10, 0.10)
+y_offset = -0.10
+offset = c(-0.061, -0.072, -0.083, -0.094) 
+fontsize = 15
+}
+
+
+# function to process datasets from Matlab (cued / distractor) # 3d: 26 230 4 sbjs, time, task (projection). 4d array: 26 230 4 dist (projection) 4 task
+process_array_3_4d <- function(data_list, array_name, labels, model_names) {    
+  array <- data_list[[array_name]]
+  mean_values <- apply(array, c(2, 3), mean, # if 4d, over the 1st and 4th dimensions (sbj and cued task); if 3d, over the 1st dimensions (sbj) only
+                       na.rm = T) # for distractor projections, 1 task/distractor combination is always nan
+  sem_values <- apply(array, c(2, 3), sd,
+                       na.rm = T) / sqrt(dim(array)[1])
+  colnames(mean_values) <- labels
+  colnames(sem_values) <- labels
+  mean_df <- as.data.frame(mean_values)
+  sem_df <- as.data.frame(sem_values)
+  mean_df$t = seq.int(nrow(mean_df))
+  mean_df$times = times
+  sem_df$t = seq.int(nrow(mean_df))
+  mean_long <- mean_df %>% pivot_longer(cols = all_of(labels), names_to = "Dimension", values_to = "value")
+  sem_long <- sem_df %>% pivot_longer(cols = all_of(labels), names_to = "Dimension", values_to = "sem")
+  result_long <- mean_long %>%    # Combine mean and SEM into a single data frame
+    left_join(sem_long, by = c("Dimension","t"))
+  result_long$Dimension <- factor(result_long$Dimension, levels = Labels)
+  result_long$model <- substr(array_name, 1, 4) %>% factor(levels = model_names)
+  
+  return(result_long)
+}
+
+
+# apply function
+model_names = c(substr(names[1], 1, 4),
+                substr(names[2], 1, 4))
+df_cued <- process_array_3_4d(enc_list, names[1], Labels, model_names)
+df_dstr <- process_array_3_4d(enc_list, names[2], Labels, model_names)
+df_allmodels <- rbind(df_cued,df_dstr) 
+# plot, each model to one subplot
+dat_text <- data.frame(
+  model   = model_names,
+  label    = if (!response_locked) {c("", "\n\n\nCue\nonset")} else {""},
+  x     = c(0, -200),
+  y     = c(0, y_offset)
+)
+x13 = df_allmodels %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = Dimension), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = Dimension, linetype = model), size = 1) +
+  scale_fill_viridis(discrete = T, name = "Dimension") +
+  scale_color_viridis(discrete = T, name = "Dimension") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = if (!response_locked){0.5}else{NA}) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off") +
+  # annotate("text", x = -200, y = -0.25, label = "Cue\nonset", size = 5) + 
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'Encoding beta') +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(model ~ ., scales="free_y") +
+  facetted_pos_scales(y = list(          # <-- one scale per panel, top to bottom
+    scale_y_continuous(limits = ylims_cued),
+    scale_y_continuous(limits = ylims_dstr)
+  )) +
+  scale_linetype_manual(values = c('solid','longdash'),guide = "none") +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label),
+  size = 4 # in pts. Conversion: fontsize / 2.845.
+) +
+  theme(
+    legend.position = "none", 
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5)
+  )
+x13
+
+# add cluster stat bars
+# prepare data matrix (sbj by times) for permuco. Design is same as for distractor average (subid, var=data vs 0)
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+enc_dstr = apply(enc_list$dstr.bytask.all, c(1, 2, 3), mean, na.rm = T) # average over cued task (preserve dim sbjs, time, dist (projection))
+enc_dstr_cluster = data.frame()
+p_x = 0.05 # critical p threshold for cluster selection
+for (dstr in 1:4){
+  dstr_mx = dat_matrix(enc_dstr[,,dstr],zero_level)
+  # run cluster mass permutation test
+  dstr_cmt = clusterlm(dstr_mx ~ var,              # cluster mass test for sr 
+                     data = design_m3, # default design
+                     np = np_iters,
+                     test = "fisher",
+                     p_scale = TRUE,
+                     threshold = 0.95) # Cluster-forming threshold
+  plot(dstr_cmt)
+  dstr_sum = summary(dstr_cmt, 'two.sided')
+  dstr_sum = data.frame(dstr_sum$var)
+  sig_clusters = dstr_sum[ (dstr_sum$P..mass. < p_x),]
+  if (length(sig_clusters$cluster.mass)>0){
+    sig_clusters$Dimension = Labels[dstr]
+    sig_clusters$offset = offset[dstr]
+    sig_clusters$model = factor('dstr') # to add error bar selectively to second facet
+    enc_dstr_cluster = rbind(enc_dstr_cluster, sig_clusters)
+  }
+}
+
+if(nrow(enc_dstr_cluster) != 0){ # add bars only if they exist (any sig cluster)
+  x13 = x13 + # adding significant cluster bars
+    geom_segment(data = enc_dstr_cluster, aes(x =  times[start], xend = times[end], 
+                                                  y = offset, yend = offset, 
+                                                  color = Dimension), size = 3)
+}
+
+ggsave(plot = x13, width = 4.5, height = 4.5, dpi = 300, filename = paste0(file_modifier,"_cued_dstr_bydim.pdf"))
+
+  
+
+```
+
+
+
+
+```{r Fig_6A, echo=FALSE, results="hide"}
+# Final Figure 6A: proportion-congruency effects on cued and distractor RSA
+PC_names = c('MI', 'Neu', 'MC')
+rsa_m3_list = read_export("Fig5_Fig6_m3_RSA_betas")
+names = names(rsa_m3_list)
+# new function to process each model (SR, SR distractors average) by PC - include averaging the two Neutral PCs
+process_array_3d_byPC <- function(data_list, array_name, model_names) {
+  array <- data_list[[array_name]]
+  # average the Neu PCs
+  neu_avg <- (array[, 1, ] + array[, 4, ]) / 2
+  new_array <- array(0, dim = c(dim(array)[1], 3, dim(array)[3])) # new array with 3 PCs 
+  new_array[, 1, ] <- array[, 2, ] # MI
+  new_array[, 2, ] <- neu_avg      # Neu
+  new_array[, 3, ] <- array[, 3, ] # MC
+  array = new_array
+  # proceed as usual
+  mean_values <- apply(array, c(2,3), mean) # over the 1st dimension (sbj) - i.e., apply over PC and times, to keep
+  sem_values <- apply(array, c(2,3), sd) / sqrt(dim(array)[1])
+  mean_values <- t(mean_values) # PC over columns
+  sem_values <- t(sem_values)
+  colnames(mean_values) <- PC_names
+  colnames(sem_values) <- PC_names
+  mean_df <- as.data.frame(mean_values)
+  sem_df <- as.data.frame(sem_values)
+  mean_df$t = seq.int(nrow(mean_df))
+  mean_df$times = times
+  sem_df$t = seq.int(nrow(mean_df))
+  mean_long <- mean_df %>% pivot_longer(cols = all_of(PC_names), names_to = "PC", values_to = "value")
+  sem_long <- sem_df %>% pivot_longer(cols = all_of(PC_names), names_to = "PC", values_to = "sem")
+  result_long <- mean_long %>%    # Combine mean and SEM into a single data frame
+    left_join(sem_long, by = c("PC","t"))
+  result_long$PC <- factor(result_long$PC, levels = PC_names)
+  result_long$model <- substr(array_name, 6, nchar(array_name)) %>% factor(levels = model_names)
+
+  
+  return(result_long)
+}
+# apply function
+model_names = c(substr(names[1], 6, nchar(names[1])),
+                substr(names[2], 6, nchar(names[2])))
+df_sr <- process_array_3d_byPC(rsa_m3_list, names[1], model_names)
+df_sr_dstr <- process_array_3d_byPC(rsa_m3_list, names[2], model_names)
+df_allmodels_m3_byPC <- rbind(df_sr,df_sr_dstr) 
+
+
+
+
+# plot, cued and non-cued in different subplots
+# ylims <- c(-0.05, 0.75)
+dat_text <- data.frame(
+  model   = unique(df_allmodels_m3_byPC$model),
+  label    = c("", "\n\n\nCue\nonset"),
+  x     = c(0, -200),
+  y     = c(0, -0.05)
+)
+x9 = df_allmodels_m3_byPC %>% 
+  ggplot() +
+  geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = PC), alpha = 0.5) +
+  geom_line(aes(x = times, y = value, color = PC), size = 1) + #  linetype = model
+  scale_fill_viridis(discrete = T, name = "PC", option = "G", begin = 0, end = 0.7) +
+  scale_color_viridis(discrete = T, name = "PC", option = "G", begin = 0, end = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+  coord_cartesian(clip = "off") + # , ylim = ylims
+  scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+  labs(x = 'Time (ms)', y = 'RSA beta') +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(model ~ ., scales="free") +
+  scale_linetype_manual(values = c('solid','dashed'),guide = "none") +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = x, y = y, label = label)
+  ) +
+  theme(
+    strip.background = element_blank(), 
+    strip.text = element_blank(), 
+    legend.title = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = 'black', linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    legend.position = "inside",
+    legend.position.inside = c(0.1, 0.87)
+  )
+
+
+# add cluster stat bars to non-cued subplot
+
+# prepare design for permuco (data frame for the independent variables)
+design_m3 = data.frame(sub_id = rep(1:26,2), var = c(rep(1,26),c(rep(0,26)) )) %>% arrange(sub_id, desc(var))
+# prepare data matrix (sbj by times) for permuco. Design is same as before (subid, var=data vs 0)
+offset = c(-0.03, -0.04, -0.05, -0.06)
+zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+sr_dstr = rsa_m3_list$fits.sr.dstr # sbjs, PC, time
+  neu_avg = (sr_dstr[, 1, ] + sr_dstr[, 4, ]) / 2
+  new_array = array(0, dim = c(dim(sr_dstr)[1], 3, dim(sr_dstr)[3])) # new array with 3 PCs
+  new_array[, 1, ] = sr_dstr[, 2, ] # MI
+  new_array[, 2, ] = neu_avg      # Neu
+  new_array[, 3, ] = sr_dstr[, 3, ] # MC
+sr_pc = aperm(new_array, c(1, 3, 2))
+sr_pc_cluster = data.frame()
+p_x = 0.05 # critical p threshold for cluster selection
+# run cluster mass permutation test for Neu, MI, MC
+for (PCidx in 1:3){
+  dstr_mx = dat_matrix(sr_pc[,,PCidx],zero_level)
+  pc_cmt = clusterlm(dstr_mx ~ var,              # cluster mass test for sr 
+                     data = design_m3,
+                     np = 5000,
+                     test = "fisher",
+                     p_scale = TRUE,
+                     threshold = 0.95) # Cluster-forming threshold
+  plot(pc_cmt)
+  PC_sum = summary(pc_cmt, 'two.sided')
+  PC_sum = data.frame(PC_sum$var)
+  sig_clusters = PC_sum[ (PC_sum$P..mass. < p_x),]
+  sig_clusters$PC = PC_names[PCidx]
+  sig_clusters$offset = offset[PCidx]
+  sig_clusters$model = factor('sr.dstr') # to add error bar selectively to second facet
+  sr_pc_cluster = rbind(sr_pc_cluster, sig_clusters)
+}
+
+x9 = x9 + # adding significant cluster bars
+  geom_segment(data = sr_pc_cluster, aes(x =  times[start], xend = times[end], 
+                                                y = offset, yend = offset, 
+                                                color = PC), size = 3)
+x9
+
+ggsave(plot = x9, width = 6, height = 6, dpi = 300, filename = "f6_m3_RSA_conjunction_cued_noncued_byPC.pdf")
+
+```
+
+
+
+
+
+
+```{r Fig_6B-E, echo=FALSE, results="hide"}
+# Final Figure 6B-E: proportion-congruency effects by distractor dimension
+
+#################################### Panel 2 - PC effects on non-cued SR by distractor dimension ####################################
+# prepare design for permuco (data frame for the independent variables)
+design_m3 = data.frame(sub_id = rep(1:26,2), var = c(rep(1,26),c(rep(0,26)) )) %>% arrange(sub_id, desc(var))
+# custom colors
+viridis_colors = viridis(3, option = "G", begin = 0, end = 0.7)# Extract 3 colors from Mako
+dim_colors = viridis(4, option = "D") 
+
+PC_names = c('MI', 'Neu', 'MC', 'MC-MI')
+rsa_m3_list = read_export("Fig6_m3_RSA_betas_bydim") # obtained with bootstrapping (bst=1)
+names = names(rsa_m3_list)
+# function to process each distractor dimension by PC - include averaging the two Neutral PCs. Process one distractor a time. Input: filtered sr.singledstr, using 1 distractor only.
+process_array_4d_filtered_to_3d_byPC <- function(array_3d, distractor_dim_name) {
+  # average the Neu PCs
+  neu_avg <- (array_3d[, 1, ] + array_3d[, 4, ]) / 2
+  MC_MI = (array_3d[, 3, ] - array_3d[, 2, ])
+  new_array <- array(0, dim = c(dim(array_3d)[1], 4, dim(array_3d)[3])) # new array with 3 PCs + 1 contrast
+  new_array[, 1, ] <- array_3d[, 2, ] # MI
+  new_array[, 2, ] <- neu_avg      # Neu
+  new_array[, 3, ] <- array_3d[, 3, ] # MC
+  new_array[, 4, ] <- MC_MI        # MC-MI
+  narray = new_array
+  # proceed as usual
+  mean_values <- apply(narray, c(2,3), mean) # over the 1st dimension (sbj) - dims:  26sbj 4pc 230times
+  sem_values <- apply(narray, c(2,3), sd) / sqrt(dim(narray)[1])
+  mean_values <- t(mean_values) # PC over columns
+  sem_values <- t(sem_values)
+  colnames(mean_values) <- PC_names
+  colnames(sem_values) <- PC_names
+  mean_df <- as.data.frame(mean_values)
+  sem_df <- as.data.frame(sem_values)
+  mean_df$t = seq.int(nrow(mean_df))
+  mean_df$times = times
+  sem_df$t = seq.int(nrow(mean_df))
+  mean_long <- mean_df %>% pivot_longer(cols = all_of(PC_names), names_to = "PC", values_to = "value")
+  sem_long <- sem_df %>% pivot_longer(cols = all_of(PC_names), names_to = "PC", values_to = "sem")
+  result_long <- mean_long %>%    # Combine mean and SEM into a single data frame
+    left_join(sem_long, by = c("PC","t"))
+  result_long$PC <- factor(result_long$PC, levels = PC_names)
+  result_long$dimension <- distractor_dim_name %>% as.factor()
+  result_long$contrast = ifelse(result_long$PC=="MC-MI", 'contrast', 'simple')
+  result_long$contrast = factor(result_long$contrast, levels=c('simple','contrast'))
+                         
+
+  return(result_long)
+}
+# take rsa_m3_list$fits.sr.singledstr (dims:  26sbj 4pc 230times 4distractors), filter one distractor dimension, apply function
+m3_array <- rsa_m3_list$fits.sr.singledstr
+alldistr_byPC_list = vector("list", length = 4) # preallocate w/ distractor
+for (distIDX in 1:4){
+  singledstr_filt = m3_array[,,,distIDX]
+  df_singledstr_byPC = process_array_4d_filtered_to_3d_byPC(singledstr_filt, paste0("dist_",Labels[distIDX]))
+  alldistr_byPC_list[[distIDX]] = df_singledstr_byPC
+}
+
+# long-format w/ PC, time, distractor
+df_alldistr_byPC = do.call(rbind, alldistr_byPC_list)
+
+
+# plot, PC simple and MC-MI contrast in different subplots
+ylims <- c(-0.12, 0.22)
+dat_text <- data.frame(
+  contrast   = unique(df_alldistr_byPC$contrast),
+  label    = c("", "\n\n\nCue\nonset"),
+  x     = c(0, -200),
+  y     = c(0, -0.13)
+)
+for (idx in 1:4){
+  all_colors = c(viridis_colors, dim_colors[idx])
+  x10 = df_alldistr_byPC %>% filter(dimension==paste0("dist_",Labels[idx])) %>%
+    ggplot() +
+    geom_ribbon(aes(x = times, ymin = value-sem, ymax = value+sem, fill = PC), alpha = 0.5) +
+    geom_line(aes(x = times, y = value, color = PC), size = 1) + #  linetype = model
+    scale_fill_manual(name = "PC", values = all_colors) +
+    scale_color_manual(name = "PC", values = all_colors) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+    geom_vline(xintercept = -200, linetype = "dotted", color = "black", size = 0.5) +
+    geom_vline(xintercept = 0, linetype = "dotted", color = "black", size = 0.5) +
+    coord_cartesian(clip = "off", ylim = ylims) + # 
+    scale_x_continuous(limits = range(times), expand = c(0, 0)) +
+    labs(x = 'Time (ms)', y = 'RSA beta') +
+    theme_minimal(base_size = fontsize) +
+    facet_grid(contrast ~ ., scales="fixed") +
+    scale_linetype_manual(values = c('solid','dashed'),guide = "none") +
+    geom_text(
+    data    = dat_text,
+    mapping = aes(x = x, y = y, label = label)
+    ) +
+    theme(
+      strip.background = element_blank(), 
+      strip.text = element_blank(), 
+      legend.title = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = 'black', linewidth = 0.5),
+      axis.ticks = element_line(colour = "black", linewidth = 0.5),
+      legend.position = "inside",
+      legend.position.inside = c(0.80, 0.45)
+    )
+  x10
+  
+
+
+
+
+  # add cluster stat bars to non-cued and non-cued MC-MI subplots
+  # prepare data matrix (sbj by times) for permuco. Design is same as before (subid, var=data vs 0)
+  offset = c(-0.095, -0.110, -0.125, -0.10)
+  zero_level = 0 # zero for testing betas, chance level for testing classification, etc
+  singledstr = rsa_m3_list$fits.sr.singledstr # 26sbj 4pc 230times 4distractors) (compared to data for plot, here we do not average over sbj)
+  sdstr_filt = singledstr[,,,idx]      # keep one distractor dim
+    neu_avg = (sdstr_filt[, 1, ] + sdstr_filt[, 4, ]) / 2
+    MC_MI = (sdstr_filt[, 3, ] - sdstr_filt[, 2, ])
+    new_array = array(0, dim = c(dim(sdstr_filt)[1], 4, dim(sdstr_filt)[3])) # new array with 3 PCs + 1 contrast
+    new_array[, 1, ] = sdstr_filt[, 2, ] # MI
+    new_array[, 2, ] = neu_avg      # Neu
+    new_array[, 3, ] = sdstr_filt[, 3, ] # MC
+    new_array[, 4, ] = MC_MI        # MC-MI
+  sd_pc = aperm(new_array, c(1, 3, 2))
+  sd_pc_cluster = data.frame()
+  p_x = 0.05 # critical p threshold for cluster selection
+  # run cluster mass permutation test for Neu, MI, MC (skip contrast)
+  for (PCidx in 1:4){
+    dstr_mx = dat_matrix(sd_pc[,,PCidx],zero_level)
+    pc_cmt = clusterlm(dstr_mx ~ var,              # cluster mass test
+                       data = design_m3,
+                       np = 5000,
+                       test = "t",
+                       p_scale = TRUE,
+                       threshold = 0.95) # Cluster-forming threshold
+    plot(pc_cmt)
+    PC_sum = summary(pc_cmt, alternative = "greater")
+    PC_sum = data.frame(PC_sum$var)
+    sig_clusters = PC_sum[ (PC_sum$P..mass. < p_x),]
+    if (length(sig_clusters$cluster.mass)>0){
+      sig_clusters$PC = PC_names[PCidx]
+      sig_clusters$offset = offset[PCidx]
+      sig_clusters$contrast = ifelse(PCidx==4,'contrast','simple') %>% as.factor() # to add error bar selectively to facets
+      sd_pc_cluster = rbind(sd_pc_cluster, sig_clusters)
+    }
+  }
+
+  
+  if(!dim(sd_pc_cluster)[1]<1){ # adding significant cluster bars, if any
+    x10 = x10 + 
+      geom_segment(data = sd_pc_cluster, aes(x =  times[start], xend = times[end], 
+                                                    y = offset, yend = offset, 
+                                                    color = PC), size = 3)
+  }
+  
+  ggsave(plot = x10, width = 6, height = 6, dpi = 300, filename = paste0("f6_m3_RSA_conjunction_noncued_byPC_distr", Labels[idx], ".pdf"))
+
+
+  x10
+}
+
+
+
+
+```
+
+```{r notreported_correlations, echo=FALSE, results="hide", eval=FALSE}
+# Unreported group-level correlations between behavioral and RSA adaptation
+
+# first get data_proc and PC_adapt from Multi_EEG_PC)
+behav_MCMI = PC_adapt
+
+# then run current script. Get EEG adaptation on each dimension
+rsa_m3_list = read_export("Fig6_m3_RSA_betas_bydim") 
+singledstr = rsa_m3_list$fits.sr.singledstr
+MC_MI = (singledstr[, 3, ,] - singledstr[, 2, ,]) # sbj, times, distractor dim
+# compute mean in 0-500ms window
+timeidx = c(which(times==0),which(times==500))
+MC_MI_win = apply(MC_MI[, timeidx[1]:timeidx[2], ], c(1,3), mean)
+
+dimnames(MC_MI_win) <- list(Rows=c(unique(behav_MCMI$subid)),
+                            Cols=c(Labels))
+
+m3_PC = as.data.frame(MC_MI_win) 
+m3_PC = cbind(rownames(m3_PC), m3_PC)
+colnames(m3_PC) <- c("subid",Labels)
+
+PC_merge = left_join(behav_MCMI, m3_PC, by = "subid")
+
+
+# run correlations
+library(corrplot)
+PC_merge_numeric = subset(PC_merge, select = -subid) 
+corrplot(cor(PC_merge_numeric))
+
+# plot(PC_merge$adapt_acc_c,PC_merge$Color)
+# r = cor.test(PC_merge$adapt_acc_c,PC_merge$Color)
+# r
+# 
+# plot(PC_merge$adapt_acc_s,PC_merge$Shape)
+# r = cor.test(PC_merge$adapt_acc_s,PC_merge$Shape)
+# r
+# 
+# plot(PC_merge$adapt_acc_e,PC_merge$Edge)
+# r = cor.test(PC_merge$adapt_acc_e,PC_merge$Edge)
+# r
+# 
+# plot(PC_merge$adapt_acc_p,PC_merge$Pattern)
+# r = cor.test(PC_merge$adapt_acc_p,PC_merge$Pattern)
+# r
+
+### Result: no detectable association between behavioral and RSA adaptation
+```

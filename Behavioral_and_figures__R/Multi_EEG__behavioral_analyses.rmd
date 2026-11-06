@@ -1,0 +1,2863 @@
+---
+title: "Multi EEG"
+author: "Davide Gheza"
+date: "1/27/2023 - streamlined 05/26/2023 - review 04/10/2024"
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+# Analysis scope
+
+This notebook imports the behavioral data for the 26-participant publication
+sample, constructs trial-history and task-specific proportion-congruency
+variables, fits the reported Bayesian models, and generates the behavioral
+panels for Figures 1--3 and 6. Paths are project-specific and must be adapted
+when the analysis is run outside the original environment.
+  
+```{r setup_environment,echo=FALSE,warning=FALSE,message=FALSE}
+
+# Initialize a reproducible R session.
+# dev.off() # clear plots
+rm(list=ls()) # clear environment
+cat("\014") # clear console
+set.seed(42) # specify seed for RNG and ensure reproducible results
+# Load analysis, Bayesian-modeling, and plotting packages.
+pacman::p_load(plyr, dplyr, tidyverse, reshape2, Rmisc, ggplot2, ez, schoRsch, pastecs, MBESS, BayesFactor, interactions, ggridges, emmeans, viridis, spatstat.utils, sjPlot, tidybayes, brms, bayestestR, R.matlab) # spatstat for revcumsum
+
+```
+
+```{r Import data, echo=FALSE, results="hide"}
+## Import version-3 behavioral data
+library(R.matlab)
+
+if(.Platform$OS.type == "unix") {
+data_dir <- ("/Users/davidegheza/Library/CloudStorage/OneDrive-Personal/Documenti/MATLAB/dg_workspace22/dimensions/data/EEG_data/")
+} else {
+data_dir <- ("C:/Users/gdavide/OneDrive/Documenti/MATLAB/dg_workspace22/dimensions/data/EEG_data/") 
+}
+
+# Directory containing the distributional-analysis helper script.
+helper_functions_path = "/Users/davidegheza/Library/CloudStorage/OneDrive-Personal/Documenti/R/Multi_EEG/"
+
+# Minimum acceptable accuracy within every cued dimension.
+threshold = 0.8
+
+# Select participants 22 and 24--48; participant 23 is excluded.
+mat_files <- list.files(path = data_dir, pattern = "^dimensions_PC_.*\\.mat$", full.names = TRUE)# List all CSV files in the directory
+mat_files <- mat_files[-c(1:21,23)]
+
+read_and_extract_data <- function(file) {
+    data=readMat(file)
+    data = data$data
+    ntrials = length(data[[9]])
+    subid = rep(as.integer(data[[2]]),ntrials)
+    if (data[[2]]==22) {
+          rt = data[[10]] # sbj 22 misses rt_c in position 11
+          correct = data[[12]] 
+          task = data[[19]] 
+          key_press = data[[11]]
+          correct_choice = data[[14]]
+          colors = data[[15]]
+          shapes = data[[16]]
+          edges = data[[17]]
+          patterns = data[[18]]
+          congruency = data[[23]]
+          task_count = data[[13]]
+          pc = data[[20]]
+          pcs_block = data[[21]]
+          pc_index = data[[22]]
+          block = data[[24]]
+    }
+    else{
+          rt = data[[10]]
+          correct = data[[13]] 
+          task = data[[20]] 
+          key_press = data[[12]]
+          correct_choice = data[[15]]
+          colors = data[[16]]
+          shapes = data[[17]]
+          edges = data[[18]]
+          patterns = data[[19]]
+          congruency = data[[24]]
+          task_count = data[[14]]
+          pc = data[[21]]
+          pcs_block = data[[22]]
+          pc_index = data[[23]]
+          block = data[[25]]
+    }
+
+    df = data.frame(subid,rt,correct,task,key_press,correct_choice,colors,shapes,edges,patterns,congruency,
+                    task_count,pc,pcs_block,pc_index,block)
+    return(df)
+}
+
+ss_df_list <- lapply(mat_files, read_and_extract_data)
+data <- do.call(rbind, ss_df_list)
+
+current_names = names(data)
+new_names <- c(current_names[1:6],
+               "left_color", "right_clor", "left_shape", "right_shape", "left_edge", "right_edge", 
+               "left_pattern", "right_pattern",
+               "congruency_color", "congruency_shape", "congruency_edge", "congruency_pattern",
+               current_names[19:20],
+               "pcs_block_1", "pcs_block_2", "pcs_block_3", "pcs_block_4",
+               current_names[25:26])
+names(data) = new_names
+
+data$subid = as.factor(data$subid)
+data$task = as.factor(data$task)
+Labels = c('Color', 'Shape', 'Edge', 'Pattern')
+
+data$key_press[data$key_press=='f'] = 5 # sbj 22 has responses coded f and j (keyboard, not response box)
+data$key_press[data$key_press=='j'] = 6
+data$rt[data$rt>0] = data$rt[data$rt>0]*1000 # transform in ms. Note that missing responses shows rt == -1
+
+```
+
+```{r Filters_acc, echo=FALSE}
+
+# count missing responses, blacklist
+data.dims = group_by(data, subid, task)
+data.dims = summarise(data.dims,
+                       noresp = sum(rt==(-1)),
+                       acc = mean(correct),
+                       trialn = sum(!is.nan(correct)))
+data.dims$blacklist = data.dims$acc<threshold # no one below threshold in any of the dim
+
+
+# No additional RT-tail rejection is applied: extreme fast trials are rare,
+# and the EEG cleaning pipeline does not apply an equivalent behavioral filter.
+# Missing responses remain in the error rate (249 of 41,600 observations).
+```
+
+
+```{r Updates, echo=FALSE}
+
+data_proc = group_by(data, subid) %>%
+  mutate(trialn = row_number(subid)) %>% #add trial index column
+  mutate(task_n = case_when(
+  task == 1 ~ 0,
+  task == 2 ~ 1,
+  task == 3 ~ 2,
+  task == 4 ~ 3
+  )) 
+# add columns with previous congruency by dimension
+data_proc = mutate(data_proc,
+  prev_0_congruent = c(NaN, head(congruency_color, -1)), # replace first row with NaN, omit last row
+  prev_1_congruent = c(NaN, head(congruency_shape, -1)),
+  prev_2_congruent = c(NaN, head(congruency_edge, -1)),
+  prev_3_congruent = c(NaN, head(congruency_pattern, -1))
+  )
+# add sum_congruency
+data_proc = group_by(data_proc, subid, trialn) %>%
+  mutate(sum_congruency = sum(congruency_color==1,congruency_shape==1,congruency_edge==1,congruency_pattern==1))
+# add previous_sum_congruency
+data_proc = group_by(data_proc, subid) %>%
+  mutate(previous_sum_congruency = c(NaN, head(sum_congruency, -1)))
+# Add congruency from two and three trials back.
+data_proc = group_by(data_proc, subid) %>%
+  mutate(previous_2_sum_congruency = c(NaN, head(previous_sum_congruency, -1)),
+         previous_3_sum_congruency = c(NaN, head(previous_2_sum_congruency, -1))
+  )
+# Mark trials following an error; invalid predecessors remain missing.
+data_proc = group_by(data_proc, subid) %>%
+  mutate(post_correct = c(1, head(correct, -1))) # first trial is '1' since post_error does not apply, so must be included
+
+# Assign each current distractor a previous/current sequence label (CC, CI,
+# IC, or II) for dimension-specific CSE analyses.
+data_proc = data_proc %>%
+  mutate(
+    prev_con_same_0 = case_when(
+  (congruency_color == 0 & prev_0_congruent==0) ~ "II",
+  (congruency_color == 0 & prev_0_congruent==1) ~ "CI",
+  (congruency_color == 1 & prev_0_congruent==0) ~ "IC",
+  (congruency_color == 1 & prev_0_congruent==1) ~ "CC"),
+    prev_con_same_1 = case_when(
+  (congruency_shape == 0 & prev_1_congruent==0) ~ "II",
+  (congruency_shape == 0 & prev_1_congruent==1) ~ "CI",
+  (congruency_shape == 1 & prev_1_congruent==0) ~ "IC",
+  (congruency_shape == 1 & prev_1_congruent==1) ~ "CC"),
+    prev_con_same_2 = case_when(
+  (congruency_edge == 0 & prev_2_congruent==0) ~ "II",
+  (congruency_edge == 0 & prev_2_congruent==1) ~ "CI",
+  (congruency_edge == 1 & prev_2_congruent==0) ~ "IC",
+  (congruency_edge == 1 & prev_2_congruent==1) ~ "CC"),
+    prev_con_same_3 = case_when(
+  (congruency_pattern == 0 & prev_3_congruent==0) ~ "II",
+  (congruency_pattern == 0 & prev_3_congruent==1) ~ "CI",
+  (congruency_pattern == 1 & prev_3_congruent==0) ~ "IC",
+  (congruency_pattern == 1 & prev_3_congruent==1) ~ "CC")
+) %>%
+mutate(                           
+  # for each current distractor, and each previous distractor...assign to each trial 3 factors same_con_different
+  # (to ensure specificity, define a different factor for each current : each other previous non-cued dimensions)
+    prev_con_dif_01 = case_when(
+  (congruency_color == 0 & (prev_1_congruent==0 )) ~ "II",
+  (congruency_color == 0 & (prev_1_congruent==1 )) ~ "CI",
+  (congruency_color == 1 & (prev_1_congruent==0 )) ~ "IC",
+  (congruency_color == 1 & (prev_1_congruent==1 )) ~ "CC"),
+    prev_con_dif_10 = case_when(
+  (congruency_shape == 0 & (prev_0_congruent==0 )) ~ "II",
+  (congruency_shape == 0 & (prev_0_congruent==1 )) ~ "CI",
+  (congruency_shape == 1 & (prev_0_congruent==0 )) ~ "IC",
+  (congruency_shape == 1 & (prev_0_congruent==1 )) ~ "CC"),    
+    prev_con_dif_20 = case_when(
+  (congruency_edge == 0 & (prev_0_congruent==0 )) ~ "II",
+  (congruency_edge == 0 & (prev_0_congruent==1 )) ~ "CI",
+  (congruency_edge == 1 & (prev_0_congruent==0 )) ~ "IC",
+  (congruency_edge == 1 & (prev_0_congruent==1 )) ~ "CC"),    
+    prev_con_dif_30 = case_when(
+  (congruency_pattern == 0 & (prev_0_congruent==0 )) ~ "II",
+  (congruency_pattern == 0 & (prev_0_congruent==1 )) ~ "CI",
+  (congruency_pattern == 1 & (prev_0_congruent==0 )) ~ "IC",
+  (congruency_pattern == 1 & (prev_0_congruent==1 )) ~ "CC"),
+  
+    prev_con_dif_02 = case_when(
+  (congruency_color == 0 & ( prev_2_congruent==0 )) ~ "II",
+  (congruency_color == 0 & ( prev_2_congruent==1 )) ~ "CI",
+  (congruency_color == 1 & ( prev_2_congruent==0 )) ~ "IC",
+  (congruency_color == 1 & ( prev_2_congruent==1 )) ~ "CC"),
+    prev_con_dif_12 = case_when(
+  (congruency_shape == 0 & ( prev_2_congruent==0 )) ~ "II",
+  (congruency_shape == 0 & ( prev_2_congruent==1 )) ~ "CI",
+  (congruency_shape == 1 & ( prev_2_congruent==0 )) ~ "IC",
+  (congruency_shape == 1 & ( prev_2_congruent==1 )) ~ "CC"),    
+    prev_con_dif_21 = case_when(
+  (congruency_edge == 0 & ( prev_1_congruent==0 )) ~ "II",
+  (congruency_edge == 0 & ( prev_1_congruent==1 )) ~ "CI",
+  (congruency_edge == 1 & ( prev_1_congruent==0 )) ~ "IC",
+  (congruency_edge == 1 & ( prev_1_congruent==1 )) ~ "CC"),    
+    prev_con_dif_31 = case_when(
+  (congruency_pattern == 0 & ( prev_1_congruent==0 )) ~ "II",
+  (congruency_pattern == 0 & ( prev_1_congruent==1 )) ~ "CI",
+  (congruency_pattern == 1 & ( prev_1_congruent==0 )) ~ "IC",
+  (congruency_pattern == 1 & ( prev_1_congruent==1 )) ~ "CC"),
+  
+      prev_con_dif_03 = case_when(
+  (congruency_color == 0 & ( prev_3_congruent==0)) ~ "II",
+  (congruency_color == 0 & ( prev_3_congruent==1)) ~ "CI",
+  (congruency_color == 1 & ( prev_3_congruent==0)) ~ "IC",
+  (congruency_color == 1 & ( prev_3_congruent==1)) ~ "CC"),
+    prev_con_dif_13 = case_when(
+  (congruency_shape == 0 & ( prev_3_congruent==0)) ~ "II",
+  (congruency_shape == 0 & ( prev_3_congruent==1)) ~ "CI",
+  (congruency_shape == 1 & ( prev_3_congruent==0)) ~ "IC",
+  (congruency_shape == 1 & ( prev_3_congruent==1)) ~ "CC"),    
+    prev_con_dif_23 = case_when(
+  (congruency_edge == 0 & ( prev_3_congruent==0)) ~ "II",
+  (congruency_edge == 0 & ( prev_3_congruent==1)) ~ "CI",
+  (congruency_edge == 1 & ( prev_3_congruent==0)) ~ "IC",
+  (congruency_edge == 1 & ( prev_3_congruent==1)) ~ "CC"),    
+    prev_con_dif_32 = case_when(
+  (congruency_pattern == 0 & ( prev_2_congruent==0)) ~ "II",
+  (congruency_pattern == 0 & ( prev_2_congruent==1)) ~ "CI",
+  (congruency_pattern == 1 & ( prev_2_congruent==0)) ~ "IC",
+  (congruency_pattern == 1 & ( prev_2_congruent==1)) ~ "CC"),
+)
+
+# combine them
+data_proc = data_proc %>% group_by(subid,trialn) %>%
+mutate(
+  II_same = 
+(sum((prev_con_same_0 == "II"),(prev_con_same_1== "II"),(prev_con_same_2 == "II"),(prev_con_same_3== "II"), na.rm=TRUE) ), 
+# do not normalize when modeling between/across separately;   was --> /3, # normalize by n possible permutation within (NB: in each trial only 3 out of the 4 conditions can be met; 1 dim is target)
+  IC_same = 
+(sum((prev_con_same_0 == "IC"),(prev_con_same_1== "IC"),(prev_con_same_2 == "IC"),(prev_con_same_3== "IC"), na.rm=TRUE) ),
+  CI_same = 
+(sum((prev_con_same_0 == "CI"),(prev_con_same_1== "CI"),(prev_con_same_2 == "CI"),(prev_con_same_3== "CI"), na.rm=TRUE) ),
+  CC_same = 
+(sum((prev_con_same_0 == "CC"),(prev_con_same_1== "CC"),(prev_con_same_2 == "CC"),(prev_con_same_3== "CC"), na.rm=TRUE) ),
+
+ II_dif = 
+(sum((prev_con_dif_01 == "II"),(prev_con_dif_02 == "II"),(prev_con_dif_03 == "II"), # consider any combination of current and previous dist.
+     (prev_con_dif_10== "II"),(prev_con_dif_12== "II"),(prev_con_dif_13== "II"),
+     (prev_con_dif_20 == "II"),(prev_con_dif_21 == "II"),(prev_con_dif_23 == "II"),
+     (prev_con_dif_30== "II"),(prev_con_dif_31== "II"),(prev_con_dif_32== "II"), na.rm=TRUE) ), 
+# do not normalize when modeling between/across separately;   was --> / 6, # normalize by n possible permutation across (NB: in each trial only 6 out of the 12 conditions can be met, as one dimension is target)
+ IC_dif = 
+(sum((prev_con_dif_01 == "IC"),(prev_con_dif_02 == "IC"),(prev_con_dif_03 == "IC"), # consider any combination of current and previous dim
+     (prev_con_dif_10== "IC"),(prev_con_dif_12== "IC"),(prev_con_dif_13== "IC"),
+     (prev_con_dif_20 == "IC"),(prev_con_dif_21 == "IC"),(prev_con_dif_23 == "IC"),
+     (prev_con_dif_30== "IC"),(prev_con_dif_31== "IC"),(prev_con_dif_32== "IC"), na.rm=TRUE) ),
+ CI_dif = 
+(sum((prev_con_dif_01 == "CI"),(prev_con_dif_02 == "CI"),(prev_con_dif_03 == "CI"), # consider any combination of current and previous dim
+     (prev_con_dif_10== "CI"),(prev_con_dif_12== "CI"),(prev_con_dif_13== "CI"),
+     (prev_con_dif_20 == "CI"),(prev_con_dif_21 == "CI"),(prev_con_dif_23 == "CI"),
+     (prev_con_dif_30== "CI"),(prev_con_dif_31== "CI"),(prev_con_dif_32== "CI"), na.rm=TRUE) ),
+ CC_dif = 
+(sum((prev_con_dif_01 == "CC"),(prev_con_dif_02 == "CC"),(prev_con_dif_03 == "CC"), # consider any combination of current and previous dim
+     (prev_con_dif_10== "CC"),(prev_con_dif_12== "CC"),(prev_con_dif_13== "CC"),
+     (prev_con_dif_20 == "CC"),(prev_con_dif_21 == "CC"),(prev_con_dif_23 == "CC"),
+     (prev_con_dif_30== "CC"),(prev_con_dif_31== "CC"),(prev_con_dif_32== "CC"), na.rm=TRUE) ),
+) 
+
+
+
+
+# add 4 columns with delays for each cued dimension, specifying the delay in blocks since last time a given dimension was cued (04/12-14/2023)
+data_proc = group_by(data_proc, subid) %>%
+  mutate(blocks = cumsum(ifelse(task_count==1,-1,0))) # not needed. can delete
+# cued dimension is color
+data_proc$is_switch_0 = ifelse(data_proc$task_count==1 & data_proc$task_n==0 ,1,0)
+data_proc$is_switch_n0 = ifelse(data_proc$task_count==1 & !data_proc$is_switch_0,1,0)
+data_proc =
+  group_by(data_proc, cumsum(is_switch_0), subid) %>% 
+  mutate(delays_0 = cumsum(is_switch_n0) )
+# cued dimension is shape
+data_proc$is_switch_1 = ifelse(data_proc$task_count==1 & data_proc$task_n==1 ,1,0)
+data_proc$is_switch_n1 = ifelse(data_proc$task_count==1 & !data_proc$is_switch_1,1,0)
+data_proc =
+  group_by(data_proc, cumsum(is_switch_1), subid) %>% 
+  mutate(delays_1 = cumsum(is_switch_n1) )
+# cued dimension is edge
+data_proc$is_switch_2 = ifelse(data_proc$task_count==1 & data_proc$task_n==2 ,1,0)
+data_proc$is_switch_n2 = ifelse(data_proc$task_count==1 & !data_proc$is_switch_2,1,0)
+data_proc =
+  group_by(data_proc, cumsum(is_switch_2), subid) %>% 
+  mutate(delays_2 = cumsum(is_switch_n2) )
+# cued dimension is pattern
+data_proc$is_switch_3 = ifelse(data_proc$task_count==1 & data_proc$task_n==3 ,1,0)
+data_proc$is_switch_n3 = ifelse(data_proc$task_count==1 & !data_proc$is_switch_3,1,0)
+data_proc =
+  group_by(data_proc, cumsum(is_switch_3), subid) %>% 
+  mutate(delays_3 = cumsum(is_switch_n3) )
+# Use `task_count == 1` to identify switch trials. The recorded transition label
+# disagrees with this sequence-based definition on 104 trials and omits each
+# participant's first trial.
+
+# # drop trials with fast (<200ms) or slow (>5 sd) RTs - NB: do now and not before not to mess with order of trials when computing previous congruency 
+# data_proc = filter(data_proc, !is.nan(correct))  # // 07/16/2025 removed trial rejection (see above)
+
+data_proc_pc = data_proc # copy of the data to use for PC analyses (no need to exclude trials following errors)
+# drop trials following errors or too fast/slow trials
+data_proc = filter(data_proc, (post_correct==1))
+
+# data_proc = filter(data_proc, (pc==0.5)) # select PC
+
+```
+
+```{r prepare_plot_data, echo=FALSE}
+
+# congruency - effect on RTs and Acc
+## effect regardless of dimension providing it
+sum_con=data_proc %>%
+        group_by(subid, sum_congruency) %>%
+        summarise(mean_rt = mean(rt[correct==1]),
+               mean_acc = mean(correct))
+## extra: by task
+sum_con_dim = data_proc %>%                             
+        group_by(subid, sum_congruency, task_n) %>%
+        summarise(mean_rt = mean(rt[correct==1]),
+                  mean_acc = mean(correct)) 
+
+# interference 
+## each distractor provides an interference
+int = data_proc %>%
+        group_by(subid) %>%
+        # summarise(mean_rt = mean(rt[correct==1]),
+        #           mean_acc = mean(correct)) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]),
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        )
+## each distractor provides an interference, on each dimension
+ints = data_proc %>%
+        group_by(subid, task_n) %>%
+        # summarise(mean_rt = mean(rt[correct==1]),
+        #           mean_acc = mean(correct)) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]), # figure edit: inc-cong
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        )
+
+
+
+
+# CSE
+## 1) CSE spaghetti plot.  (use current and prev_sum_congruency)
+prev_sum=data_proc %>%
+        filter(task_count>1 & !is.nan(previous_sum_congruency)) %>%
+        group_by(subid, sum_congruency, previous_sum_congruency) %>%
+        summarise(mean_rt = mean(rt[correct==1]),
+                  mean_acc = mean(correct))
+## 2) CSE within [bars] or between dimensions [heatmap]     (use current and prev CNG by dim)
+prev_d0_int = data_proc %>%
+        filter(task_count>1 ) %>% 
+        group_by(subid, prev_0_congruent) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]),
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        ) %>%
+        filter(prev_0_congruent!=-1) %>%                      # drop trials following a trial where cued dimension = color (can't be congruent nor incongruent for color)
+        mutate(prev_ref = 0,
+               prev_cng = prev_0_congruent) %>%
+        mutate(prev_0_congruent = factor(prev_0_congruent,
+                                         levels = c(0, 1),
+                                         labels = c("pre_0_inc", "pre_0_con")))
+        colnames(prev_d0_int)[2] = "prev_congruency_by_dim"
+prev_d1_int = data_proc %>%
+        filter(task_count>1 ) %>% 
+        group_by(subid, prev_1_congruent) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]),
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        ) %>%
+        filter(prev_1_congruent!=-1) %>%                      # drop trials following a trial where cued dimension = shape (can't be congruent nor incongruent for shape)
+        mutate(prev_ref = 1,
+        prev_cng = prev_1_congruent) %>%
+        mutate(prev_1_congruent = factor(prev_1_congruent,
+                                         levels = c(0, 1),
+                                         labels = c("pre_1_inc", "pre_1_con")))
+        colnames(prev_d1_int)[2] = "prev_congruency_by_dim"
+prev_d2_int = data_proc %>%
+        filter(task_count>1 ) %>% 
+        group_by(subid, prev_2_congruent) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]),
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        ) %>%
+        filter(prev_2_congruent!=-1) %>%                      # drop trials following a trial where cued dimension = edge (can't be congruent nor incongruent for edge)
+        mutate(prev_ref = 2,
+        prev_cng = prev_2_congruent) %>%
+        mutate(prev_2_congruent = factor(prev_2_congruent,
+                                         levels = c(0, 1),
+                                         labels = c("pre_2_inc", "pre_2_con")))
+        colnames(prev_d2_int)[2] = "prev_congruency_by_dim"
+prev_d3_int = data_proc %>%
+        filter(task_count>1 ) %>% 
+        group_by(subid, prev_3_congruent) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]),
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        ) %>%
+        filter(prev_3_congruent!=-1) %>%                      # drop trials following a trial where cued dimension = pattern (can't be congruent nor incongruent for pattern)
+        mutate(prev_ref = 3,
+        prev_cng = prev_3_congruent) %>%
+        mutate(prev_3_congruent = factor(prev_3_congruent,
+                                         levels = c(0, 1),
+                                         labels = c("pre_3_inc", "pre_3_con")))
+        colnames(prev_d3_int)[2] = "prev_congruency_by_dim"
+
+prev_ds_int=rbind(prev_d0_int,prev_d1_int,prev_d2_int,prev_d3_int) 
+
+prev_ds_int_delta = group_by(prev_ds_int, subid, prev_ref) %>%
+                    summarise(d_int_rt_0 = int_rt_0[prev_cng==1] - int_rt_0[prev_cng==0],
+                           d_int_rt_1 = int_rt_1[prev_cng==1] - int_rt_1[prev_cng==0],
+                           d_int_rt_2 = int_rt_2[prev_cng==1] - int_rt_2[prev_cng==0],
+                           d_int_rt_3 = int_rt_3[prev_cng==1] - int_rt_3[prev_cng==0],
+                           d_int_acc_0 = int_acc_0[prev_cng==1] - int_acc_0[prev_cng==0],
+                           d_int_acc_1 = int_acc_1[prev_cng==1] - int_acc_1[prev_cng==0],
+                           d_int_acc_2 = int_acc_2[prev_cng==1] - int_acc_2[prev_cng==0],
+                           d_int_acc_3 = int_acc_3[prev_cng==1] - int_acc_3[prev_cng==0])
+
+
+
+
+# PC effects
+## PC spaghetti plot.  (including switch trials)
+PC_sum_con=data_proc_pc %>%
+        # filter(task_count>1) %>%
+        group_by(subid, sum_congruency, pc) %>%
+        summarise(mean_rt = mean(rt[correct==1]),
+                  mean_acc = mean(correct))
+## Proportion-congruency effect by trial position within task-repeat sequences
+PC_sum_con_taskcount=data_proc_pc %>%
+        mutate(task_count_bin = case_when(
+          (task_count == 1) ~ "Switch trial",
+          (task_count == 2 | task_count == 3) ~ "2nd & 3rd",
+          (task_count == 4 | task_count == 5) ~ "4th & 5th")) %>%
+        group_by(subid, sum_congruency, pc, task_count_bin) %>%
+        summarise(mean_rt = mean(rt[correct==1]),
+                  mean_acc = mean(correct))
+## PC adaptation by distractor dimension (MC-MI interference effect difference)
+PC_int = data_proc_pc %>%
+        # filter(task_count>1 ) %>% 
+        group_by(subid, pc) %>%
+        summarise(
+          int_rt_0 = mean(rt[correct==1 & congruency_color==0])-mean(rt[correct==1 & congruency_color==1]),
+          int_rt_1 = mean(rt[correct==1 & congruency_shape==0])-mean(rt[correct==1 & congruency_shape==1]), 
+          int_rt_2 = mean(rt[correct==1 & congruency_edge==0])-mean(rt[correct==1 & congruency_edge==1]),
+          int_rt_3 = mean(rt[correct==1 & congruency_pattern==0])-mean(rt[correct==1 & congruency_pattern==1]),
+          int_acc_0 = mean(correct[congruency_color==0])-mean(correct[congruency_color==1]),
+          int_acc_1 = mean(correct[congruency_shape==0])-mean(correct[congruency_shape==1]), 
+          int_acc_2 = mean(correct[congruency_edge==0])-mean(correct[congruency_edge==1]),
+          int_acc_3 = mean(correct[congruency_pattern==0])-mean(correct[congruency_pattern==1])
+        ) 
+
+PC_adapt = PC_int %>%
+        group_by(subid) %>%
+        summarise(adapt_rt_c = int_rt_0[pc==1/3] - int_rt_0[pc==2/3],
+                  adapt_rt_s = int_rt_1[pc==1/3] - int_rt_1[pc==2/3],
+                  adapt_rt_e = int_rt_2[pc==1/3] - int_rt_2[pc==2/3],
+                  adapt_rt_p = int_rt_3[pc==1/3] - int_rt_3[pc==2/3],
+                  adapt_acc_c = int_acc_0[pc==1/3] - int_acc_0[pc==2/3],
+                  adapt_acc_s = int_acc_1[pc==1/3] - int_acc_1[pc==2/3],
+                  adapt_acc_e = int_acc_2[pc==1/3] - int_acc_2[pc==2/3],
+                  adapt_acc_p = int_acc_3[pc==1/3] - int_acc_3[pc==2/3])
+
+
+```
+
+
+
+
+
+## Publication figure panels
+
+
+```{r plot, echo=FALSE, eval=TRUE}
+# function to transform accuracy plots' labels in percentage
+mult_format <- function() {
+     function(x) format(100*x,digits = 3) 
+}
+
+
+# Figure 4D (top): RT distribution by cued dimension.
+hist(data_proc$rt)
+data_proc %>%
+  filter(correct==1) %>%
+  ggplot(aes(rt)) +
+  geom_density()
+
+
+x0 = data_proc %>%
+  filter(correct==1) %>%
+  mutate(task = factor(task, levels = c(1,3,2,4),labels = Labels[order(c(1,3,2,4))] )) %>% # reorder levels so "edge" is behind "shape"
+  ggplot(aes(rt, fill = task, color = task)) +
+  geom_histogram(position = "identity", binwidth = 20, alpha = 0.6, color = "black") +
+  theme_minimal(base_size =  14) +
+  labs(title = "", # Reaction Time Distribution by Dimension
+       x = "Reaction Time (ms)",
+       y = "Frequency") +
+  scale_fill_viridis_d(name = "Task dimension", limits = Labels) + # limits allows to force the order in the legend only ...
+  scale_color_viridis_d(name = "Task dimension", limits = Labels) + # this is important for maintaining the color mapping
+  scale_x_continuous(limits = range(-200, 1490), expand = c(0, 0)) +
+  theme(
+    legend.position = c(0.05, 0.95), # Position legend in the top right corner within the plot
+    legend.justification = c("left", "top"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5))
+x0
+# ggsave(plot = x0, width = 5, height = 4, dpi = 300, filename = "EEG_rt_distribution_by_task.pdf")
+
+
+# Figure 1D-E: parametric congruency effects.
+x1 = sum_con%>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  summarySEwithin(measurevar="mean_rt", withinvars="sum_congruency", idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_rt)) + 
+  geom_line(group=1,linetype=1, color="black", size=1) + #figure edit
+  geom_point(size=2) + #figure edit
+  geom_errorbar(aes(ymin=mean_rt-se, ymax=mean_rt+se), width=.18, size=0.8, # figure edit
+                position=position_dodge(0.05)) +
+  labs(title="", x="Congruency", y = "Reaction time (ms)") + # figure edit: dropped "RTs by congruency"
+  theme_classic() +
+  theme(axis.text = element_text(size = 15), #figure edit
+        axis.title = element_text(size = 15))
+x1
+# ggsave(plot = x1, width = 5, height = 4, dpi = 300, filename = "EEG_sum_con_rt.pdf")
+x2 = sum_con%>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  summarySEwithin(measurevar="mean_acc", withinvars="sum_congruency", idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_acc)) + 
+  geom_line(group=1,linetype=1, color="black", size=1) + #figure edit
+  geom_point(size=2) + #figure edit
+  geom_errorbar(aes(ymin=mean_acc-se, ymax=mean_acc+se), width=.18, size=0.8, # figure edit
+                position=position_dodge(0.05)) +
+  scale_y_continuous(labels = mult_format()) + # figure edit
+  labs(title="", x="Congruency", y = "Accuracy (%)") + # figure edit: dropped "Accuracy by congruency"
+  theme_classic() +
+  theme(axis.text = element_text(size = 15), #figure edit
+        axis.title = element_text(size = 15))  
+x2
+# ggsave(plot = x2, width = 5, height = 4, dpi = 300, filename = "EEG_sum_con_acc.pdf")
+## regardless, by dimension
+sum_con_dim%>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  mutate(task_n = factor(task_n)) %>%
+  summarySEwithin(measurevar="mean_rt", withinvars=c("sum_congruency","task_n"), idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_rt, group=task_n, color=task_n)) + 
+  geom_line(linetype=2, color="grey") +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_rt-se, ymax=mean_rt+se), width=.2,
+                position=position_dodge(0)) +
+  scale_color_discrete(name = "Task", labels=Labels) +
+  labs(title="RTs by congruency and task", x="Congruency", y = "Reaction time (ms)") + 
+  theme_classic()
+sum_con_dim%>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  mutate(task_n = factor(task_n)) %>%
+  summarySEwithin(measurevar="mean_acc", withinvars=c("sum_congruency","task_n"), idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_acc, group=task_n, color=task_n)) + 
+  geom_line(linetype=2, color="grey") +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_acc-se, ymax=mean_acc+se), width=.2,
+                position=position_dodge(0)) +
+  scale_color_discrete(name = "Task", labels=Labels) +
+  labs(title="Accuracy by congruency and task", x="Congruency", y = "Accuracy") + 
+  theme_classic()
+
+# Figure 1F-G: interference by distractor dimension.
+x3 = int%>%
+  pivot_longer(int_rt_0:int_rt_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim)) %>%
+  ggplot(aes(x=Interfering_dim, y=interference, fill=Interfering_dim)) + 
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  coord_cartesian(ylim=c(-35,60)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(discrete = T) +
+  theme_classic() + 
+  scale_x_discrete(labels=Labels) +
+  labs(title="", x="Interfering dimension", y = "Delta RT (ms)") +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15)) +
+        geom_hline(yintercept = 0, linetype = "dashed")
+x3
+# ggsave(plot = x3, width = 6, height = 4, dpi = 300, filename = "EEG_int_rt.pdf")
+
+
+
+x4 = int%>%
+  pivot_longer(int_acc_0:int_acc_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim)) %>%
+  ggplot(aes(x=Interfering_dim, y=interference, fill=Interfering_dim)) + 
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  coord_cartesian(ylim=c(-0.080,0.015)) +
+  scale_y_continuous(expand = c(0,0), # figure edit
+                     labels = mult_format()) +
+  scale_fill_viridis(discrete = T, labels=Labels) +
+  theme_classic() + 
+  scale_x_discrete(labels=Labels) +
+  labs(title="", x="Interfering dimension", y = "Delta accuracy (%)") + 
+  theme(legend.position = "none",
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        axis.line.x.bottom = element_blank(),
+        axis.line.x.top = element_line(color="black"),
+        axis.text.x.top = element_blank()) + 
+        guides(x.sec="axis") +
+        geom_hline(yintercept = 0, linetype = "dashed") 
+x4
+# ggsave(plot = x4, width = 6, height = 4, dpi = 300, filename = "EEG_int_acc.pdf")
+
+
+
+## each distractor on each dimension
+ints%>%
+  pivot_longer(int_rt_0:int_rt_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim)) %>%
+  mutate(task_n = factor(task_n, levels = c(0,1,2,3))) %>% # warning: changing order does not reorder task labels
+  summarySEwithin(measurevar="interference", withinvars=c("Interfering_dim", "task_n"), idvar="subid", na.rm=TRUE, conf.interval=.95) %>%
+  group_by(Interfering_dim) %>% 
+  mutate(ciPos = revcumsum(ifelse(is.na(interference), 0, interference)) + interference*0) %>% # vertical offset for error bars (bars plotted from bottom to top, while bar are stacked from top to bottom)
+  ggplot(aes(x=Interfering_dim, y=interference, fill=task_n)) + 
+  geom_bar(stat="identity", position="stack", width=0.5) +
+  scale_fill_viridis(discrete = T, name = "Cued task", labels=Labels) +
+  geom_text(aes(label=round(interference,1)), color="white", size=3.5, position = position_stack(vjust =  0.5)) +
+  theme_classic() + 
+  geom_errorbar(aes(ymin=ciPos-se, ymax=ciPos+se), width=.2, position="identity") +
+  scale_x_discrete(labels=Labels) +
+  labs(title="RT - Inteference by distractor", x="Interfering dimension", y = "Delta RT (ms)") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        axis.text.y=element_blank())  # effects are not cumulative
+x3b = ints%>%
+  pivot_longer(int_rt_0:int_rt_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim)) %>%
+  mutate(task_n = factor(task_n, levels = c(0,1,2,3))) %>% # warning: changing order does not reorder task labels
+  ggplot(aes(x=Interfering_dim, y=interference, fill=task_n)) + 
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  coord_cartesian(ylim=c(-75,110)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(discrete = T, name = "Cued task", labels=Labels) +
+  theme_classic() + 
+  scale_x_discrete(labels=Labels) +
+  labs(title="", x="Interfering dimension", y = "Delta RT (ms)") + # figure edit: dropped "RT - Inteference by distractor"
+  theme(legend.position = "none",
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13)) +
+        geom_hline(yintercept = 0, linetype = "dashed") +
+        guides(fill = guide_legend(nrow = 1))
+x3b
+# ggsave(plot = x3b, width = 6, height = 4, dpi = 300, filename = "EEG_ints_rt.pdf")
+
+ints%>%
+  pivot_longer(int_acc_0:int_acc_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim)) %>%
+  mutate(task_n = factor(task_n, levels = c(0,1,2,3))) %>% # warning: changing order does not reorder task labels
+  summarySEwithin(measurevar="interference", withinvars=c("Interfering_dim", "task_n"), idvar="subid", na.rm=TRUE, conf.interval=.95) %>%
+  group_by(Interfering_dim) %>% 
+  mutate(ciPos = revcumsum(ifelse(is.na(interference), 0, interference)) + interference*0) %>% # vertical offset for error bars (bars plotted from bottom to top, while bar are stacked from top to bottom)
+  ggplot(aes(x=Interfering_dim, y=interference, fill=task_n)) + 
+  geom_bar(stat="identity", position="stack", width=0.5) +
+  scale_fill_viridis(discrete = T, name = "Cued task", labels=Labels) +
+  geom_text(aes(label=round(interference,3)), color="white", size=3.5, position = position_stack(vjust =  0.5)) +
+  theme_classic() + 
+  geom_errorbar(aes(ymin=ciPos-se, ymax=ciPos+se), width=.2, position="identity") +
+  scale_x_discrete(labels=Labels) +
+  labs(title="Accuracy - Inteference by distractor", x="Interfering dimension", y = "Delta accuracy") +
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 12),
+        axis.text.y=element_blank())  # effects are not cumulative
+x4b = ints%>%
+  pivot_longer(int_acc_0:int_acc_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim)) %>%
+  mutate(task_n = factor(task_n, levels = c(0,1,2,3))) %>% # warning: changing order does not reorder task labels
+  ggplot(aes(x=Interfering_dim, y=interference, fill=task_n)) + 
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  coord_cartesian(ylim=c(-0.200,0.060)) +
+  scale_y_continuous(expand = c(0,0), # figure edit
+                     labels = mult_format()) +
+  scale_fill_viridis(discrete = T, name = "Cued task", labels=Labels) +
+  theme_classic() + 
+  scale_x_discrete(labels=Labels) +
+  labs(title="", x="Interfering dimension", y = "Delta accuracy (%)") + # figure edit: dropped "Accuracy - Inteference by distractor"
+  theme(legend.position = c(0.4, 1.15),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        axis.line.x.bottom = element_blank(),
+        axis.line.x.top = element_line(color="black"),
+        axis.text.x.top = element_blank(),
+        plot.margin = unit(c(0.15, 0.015, 0.015, 0.015), "npc")) + # Remove upper x-axis labels
+        guides(x.sec="axis") +
+        geom_hline(yintercept = 0, linetype = "dashed") +
+        guides(fill = guide_legend(nrow = 2, title.position = "left"))
+x4b
+# ggsave(plot = x4b, width = 6, height = 4, dpi = 300, filename = "EEG_ints_acc.pdf")
+
+# Figure 2A-B: parametric congruency-sequence effects.
+x5 = prev_sum %>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  mutate(previous_sum_congruency = factor(previous_sum_congruency)) %>%
+  summarySEwithin(measurevar="mean_rt", withinvars=c("sum_congruency","previous_sum_congruency"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_rt, group=previous_sum_congruency, color=previous_sum_congruency)) + 
+  geom_line(linetype=1,size=1) + # figure edit
+  geom_point(size=2) + # figure edit
+  geom_errorbar(aes(ymin=mean_rt-se, ymax=mean_rt+se), width=.6, size=0.8, # figure edit
+                position=position_dodge(0)) +
+  scale_color_viridis(discrete=T, name = "# Previous\n   congruent\n   dimensions", # figure edit
+                      begin = 0.7,
+                      end = 1,
+                      option="turbo") + # or scale_color_discrete 
+  guides(colour = guide_legend(title.position = "left")) + # figure edit
+  labs(title="", x="# Congruent dimensions", y = "Reaction time (ms)") + # figure edit: dropped "Congruency sequence effects on RT"
+  scale_y_continuous(breaks=seq(625,800,20)) +  # figure edit
+  theme_classic() + 
+  theme(legend.position = c(0.45, 0.2),
+        axis.text = element_text(size = 15), # figure edit
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) 
+x5
+# ggsave(plot = x5, width = 5, height = 4, dpi = 300, filename = "EEG_spaghetti_rt.pdf")
+x6 = prev_sum %>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  mutate(previous_sum_congruency = factor(previous_sum_congruency)) %>%
+  summarySEwithin(measurevar="mean_acc", withinvars=c("sum_congruency","previous_sum_congruency"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_acc, group=previous_sum_congruency, color=previous_sum_congruency)) + 
+  geom_line(linetype=1,size=1) + # figure edit
+  geom_point(size=2) + # figure edit
+  geom_errorbar(aes(ymin=mean_acc-se, ymax=mean_acc+se), width=.6, size=0.8, # figure edit
+                position=position_dodge(0)) +
+  scale_y_continuous(labels = mult_format()) + # figure edit
+  scale_color_viridis(discrete=T, name = "# Previous\n   congruent\n   dimensions", # figure edit
+                      begin = 0.7,
+                      end = 1,
+                      option="turbo") + # or scale_color_discrete
+  guides(colour = guide_legend(title.position = "left")) + # figure edit
+  labs(title="", x="# Congruent dimensions", y = "Accuracy (%)") + # figure edit: dropped "Congruency sequence effects on accuracy"
+  theme_classic() + 
+  theme(legend.position = c(0.75, 0.3),
+        axis.text = element_text(size = 15), # figure edit
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) 
+x6
+# ggsave(plot = x6, width = 5, height = 4, dpi = 300, filename = "EEG_spaghetti_acc.pdf")
+
+
+# Figure 2C: dimension-specific RT adaptation heatmap.
+htmp = prev_ds_int_delta %>% group_by(prev_ref) %>%
+  summarise(across(everything(), list(mean=mean))) %>% # group mean
+  select(d_int_rt_0_mean:d_int_rt_3_mean) %>%          # select RTs
+  as_tibble() %>%
+  rownames_to_column("Prev_dist") %>%
+  pivot_longer(-Prev_dist, names_to = "Curr_dist", values_to = "adaptation") %>%
+  mutate(
+    Prev_dist = factor(Prev_dist, labels = Labels),
+    Curr_dist = factor(Curr_dist, labels = Labels)
+  ) %>%
+  ggplot(aes(Prev_dist, reorder(Curr_dist,desc(Curr_dist)))) + # to flip y axis
+  geom_tile(aes(fill = adaptation), color="black") +            # figure edit: added lines between cells
+  geom_text(aes(label = round(adaptation, 1)), size=5) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 15), # figure edit
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        legend.key.height= unit(1, 'cm')) + # figure edit
+  scale_x_discrete(expand=c(0,0)) + # figure edit (remove edge area)
+  scale_y_discrete(expand=c(0,0))
+x7 = htmp + 
+  labs(x="Previous non-cued dimension", # figure edit: dropped  (congruent-incongruent), dropped title="Reaction time",
+       y = "Current non-cued dimension", # figure edit: dropped  (incongruent-congruent)
+       fill = "Adaptation\n    (ms)") # figure edit
+x7
+# ggsave(plot = x7, width = 8, height = 5, dpi = 300, filename = "EEG_heatmap_rt.pdf")
+# Figure 2D: dimension-specific accuracy adaptation heatmap.
+htmp = prev_ds_int_delta %>% group_by(prev_ref) %>%
+  summarise(across(everything(), list(mean=mean))) %>% # group mean
+  select(d_int_acc_0_mean:d_int_acc_3_mean) %>%        # select Accuracy
+  as_tibble() %>%
+  rownames_to_column("Prev_dist") %>%
+  pivot_longer(-Prev_dist, names_to = "Curr_dist", values_to = "adaptation") %>%
+  mutate(
+    Prev_dist = factor(Prev_dist, labels = Labels),
+    Curr_dist = factor(Curr_dist, labels = Labels)
+  ) %>%
+  ggplot(aes(Prev_dist, reorder(Curr_dist,desc(Curr_dist)) )) + # to flip y axis
+  geom_tile(aes(fill = adaptation*100), color="black") +            # figure edit: x100, added lines between cells
+  geom_text(aes(label = round(adaptation*100, 1)), size=5) + # figure edit: x100 to get percentage
+  scale_fill_gradient(low = "red", high = "white") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 15), # figure edit
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        legend.key.height= unit(1, 'cm')) + # figure edit
+  scale_x_discrete(expand=c(0,0)) + # figure edit (remove edge area)
+  scale_y_discrete(expand=c(0,0))
+x8 = htmp + 
+  labs(x="Previous non-cued dimension", # figure edit: dropped  (congruent-incongruent), dropped title="Accuracy",
+       y = "Current non-cued dimension", # figure edit: dropped  (incongruent-congruent)
+       fill = "Adaptation\n      (%)") # figure edit
+x8
+# ggsave(plot = x8, width = 8, height = 5, dpi = 300, filename = "EEG_heatmap_acc.pdf")
+
+
+
+
+
+
+# Figure 2G-H: task-specific proportion-congruency effects.
+xPC1 = PC_sum_con %>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  mutate(pc = factor(pc, levels = c(1/3, 1/2, 2/3), labels = c("MI", "Neutral", "MC"))) %>%
+  summarySEwithin(measurevar="mean_rt", withinvars=c("sum_congruency","pc"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_rt, group=pc, color=pc)) + 
+  geom_line(linetype=1,size=1) + 
+  geom_point(size=2) + 
+  geom_errorbar(aes(ymin=mean_rt-se, ymax=mean_rt+se), width=.6, size=0.8, 
+                position=position_dodge(0)) +
+  scale_color_viridis(discrete=T, name = "Proportion\ncongruency\n", 
+                      option = "G", begin = 0, end = 0.7) + 
+  guides(colour = guide_legend(title.position = "left")) + 
+  labs(title="", x="# Congruent dimensions", y = "Reaction time (ms)") +
+  scale_y_continuous(breaks=seq(625,800,20)) +
+  theme_classic() + 
+  theme(legend.position = "null", # c(0.45, 0.2),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) 
+xPC1
+# ggsave(plot = xPC1, width = 5, height = 4, dpi = 300, filename = "EEG_PCspaghetti_rt.pdf")
+xPC2 = PC_sum_con %>%
+  mutate(sum_congruency = factor(sum_congruency)) %>%
+  mutate(pc = factor(pc, levels = c(1/3, 1/2, 2/3), labels = c("MI", "Neutral", "MC"))) %>%
+  summarySEwithin(measurevar="mean_acc", withinvars=c("sum_congruency","pc"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_acc, group=pc, color=pc)) + 
+  geom_line(linetype=1,size=1) + 
+  geom_point(size=2) + 
+  geom_errorbar(aes(ymin=mean_acc-se, ymax=mean_acc+se), width=.6, size=0.8, 
+                position=position_dodge(0)) +
+  scale_y_continuous(labels = mult_format()) + 
+  scale_color_viridis(discrete=T, name = "Proportion\ncongruency\n", 
+                      option = "G", begin = 0, end = 0.7) + 
+  guides(colour = guide_legend(title.position = "left")) + 
+  labs(title="", x="# Congruent dimensions", y = "Accuracy (%)") + 
+  theme_classic() + 
+  theme(legend.position = c(0.75, 0.3),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) 
+xPC2
+# ggsave(plot = xPC2, width = 5, height = 4, dpi = 300, filename = "EEG_PCspaghetti_acc.pdf")
+
+
+
+
+# Figure 2I-J: MC-minus-MI adaptation by distractor dimension.
+xPC3 = PC_adapt%>%
+  pivot_longer(adapt_rt_c:adapt_rt_p, names_to = "Interfering_dim", values_to = "adaptation") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim, 
+         levels=c("adapt_rt_c","adapt_rt_s","adapt_rt_e","adapt_rt_p"))) %>% # enforce order
+  ggplot(aes(x=Interfering_dim, y=adaptation, fill=Interfering_dim)) + 
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  coord_cartesian(ylim=c(-110,90)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(discrete = T) +
+  theme_classic() + 
+  scale_x_discrete(labels=Labels) +
+  labs(title="", x="Interfering dimension", y = "Delta RT (ms)") +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15)) +
+        geom_hline(yintercept = 0, linetype = "dashed")
+xPC3
+# ggsave(plot = xPC3, width = 6, height = 4, dpi = 300, filename = "EEG_PCadapt_MCMI_rt.pdf")
+
+
+
+xPC4 = PC_adapt%>%
+  pivot_longer(adapt_acc_c:adapt_acc_p, names_to = "Interfering_dim", values_to = "adaptation") %>% # long format
+  mutate(Interfering_dim = factor(Interfering_dim, 
+         levels=c("adapt_acc_c","adapt_acc_s","adapt_acc_e","adapt_acc_p"))) %>% # enforce order
+  ggplot(aes(x=Interfering_dim, y=adaptation, fill=Interfering_dim)) + 
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  coord_cartesian(ylim=c(-0.060,0.100)) +
+  scale_y_continuous(expand = c(0,0), # figure edit
+                     labels = mult_format()) +
+  scale_fill_viridis(discrete = T, labels=Labels) +
+  theme_classic() + 
+  scale_x_discrete(labels=Labels) +
+  labs(title="", x="Interfering dimension", y = "Delta accuracy (%)") + 
+  theme(legend.position = "none",
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        axis.line.x.bottom = element_blank(),
+        axis.line.x.top = element_line(color="black"),
+        axis.text.x.top = element_blank()) + 
+        guides(x.sec="axis") +
+        geom_hline(yintercept = 0, linetype = "dashed") 
+xPC4
+# ggsave(plot = xPC4, width = 6, height = 4, dpi = 300, filename = "EEG_PCadapt_MCMI_acc.pdf")
+
+
+
+## Proportion-congruency effects by position within the task-repeat sequence
+xPC5 = PC_sum_con_taskcount %>%
+  mutate(sum_congruency = factor(sum_congruency),
+         pc = factor(pc, levels = c(1/3, 1/2, 2/3), labels = c("MI", "Neutral", "MC")),
+         position = factor(task_count_bin, levels = c("Switch trial", "2nd & 3rd","4th & 5th"), labels = c("Switch\ntrial", "2nd & 3rd\ntrials","4th & 5th\ntrials"))) %>%
+  summarySEwithin(measurevar="mean_rt", withinvars=c("sum_congruency","pc","position"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_rt, group=pc, color=pc)) + 
+  geom_line(linetype=1,size=1) + 
+  geom_point(size=2) + 
+  geom_errorbar(aes(ymin=mean_rt-se, ymax=mean_rt+se), width=.6, size=0.8, 
+                position=position_dodge(0)) +
+  scale_color_viridis(discrete=T, name = "Proportion\ncongruency\n", 
+                      option = "G", begin = 0, end = 0.7) + 
+  guides(colour = guide_legend(title.position = "left")) + 
+  labs(title="", x="# Congruent dimensions", y = "Reaction time (ms)") +
+  scale_y_continuous(breaks=seq(630,930,40)) +
+  theme_classic() + 
+  theme(legend.position = c(0.75, 0.7),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        strip.text.x = element_text(size = 15)) +
+  facet_grid(. ~ position) 
+xPC5
+ggsave(plot = xPC5, width = 5, height = 4, dpi = 300, filename = "EEG_PCspaghetti_taskcount_rt.pdf")
+
+xPC6 = PC_sum_con_taskcount %>%
+  mutate(sum_congruency = factor(sum_congruency),
+         pc = factor(pc, levels = c(1/3, 1/2, 2/3), labels = c("MI", "Neutral", "MC")),
+         position = factor(task_count_bin, levels = c("Switch trial", "2nd & 3rd","4th & 5th"), labels = c("Switch\ntrial", "2nd & 3rd\ntrials","4th & 5th\ntrials"))) %>%
+  summarySEwithin(measurevar="mean_acc", withinvars=c("sum_congruency","pc","position"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_acc, group=pc, color=pc)) + 
+  geom_line(linetype=1,size=1) + 
+  geom_point(size=2) + 
+  geom_errorbar(aes(ymin=mean_acc-se, ymax=mean_acc+se), width=.6, size=0.8, 
+                position=position_dodge(0)) +
+  scale_y_continuous(labels = mult_format()) + 
+  scale_color_viridis(discrete=T, name = "Proportion\ncongruency\n", 
+                      option = "G", begin = 0, end = 0.7) + 
+  guides(colour = guide_legend(title.position = "left")) + 
+  labs(title="", x="# Congruent dimensions", y = "Accuracy (%)") + 
+  theme_classic() + 
+  theme(legend.position = c(0.75, 0.3),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        strip.text.x = element_text(size = 15)) +
+  facet_grid(. ~ position) 
+xPC6
+ggsave(plot = xPC6, width = 5, height = 4, dpi = 300, filename = "EEG_PCspaghetti_taskcount_acc.pdf")
+
+# Figure 6F: RT proportion-congruency effect on switch trials only.
+xPC5_1 = PC_sum_con_taskcount %>%
+  filter(task_count_bin == "Switch trial") %>%
+  mutate(sum_congruency = factor(sum_congruency),
+         pc = factor(pc, levels = c(1/3, 1/2, 2/3), labels = c("MI", "Neutral", "MC"))) %>%
+  summarySEwithin(measurevar="mean_rt", withinvars=c("sum_congruency","pc"), 
+                  idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  ggplot(aes(x=sum_congruency, y=mean_rt, group=pc, color=pc)) + 
+  geom_line(linetype=1,size=1) + 
+  geom_point(size=2) + 
+  geom_errorbar(aes(ymin=mean_rt-se, ymax=mean_rt+se), width=.6, size=0.8, 
+                position=position_dodge(0)) +
+  scale_color_viridis(discrete=T, name = "Proportion\ncongruency\n", 
+                      option = "G", begin = 0, end = 0.7) + 
+  guides(colour = guide_legend(title.position = "left")) + 
+  labs(title="", x="# Congruent dimensions", y = "Reaction time (ms)") +
+  scale_y_continuous(breaks=seq(630,930,40)) +
+  theme_classic() + 
+  theme(legend.position = c(0.53, 0.83),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        strip.text.x = element_text(size = 15))
+xPC5_1
+ggsave(plot = xPC5_1, width = 5, height = 4, dpi = 300, filename = "EEG_PCspaghetti_switchtrial_rt.pdf")
+```
+
+
+Each dimension's interference. 
+```{r Dimensions_interference, echo=FALSE, message=FALSE}
+
+
+# separate interference effects by non-cued dimension (as plotted)
+int_long = int%>%
+  pivot_longer(int_rt_0:int_acc_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format - both RTs and ACC
+  mutate(Interfering_dim = factor(Interfering_dim),
+         outcome_var = substring(Interfering_dim, first=5, last=6),
+         Interfering_dim = substring(Interfering_dim, first=8, last=9)) 
+  ### tests
+  BFs_int_RT = matrix(data=NA,nrow=4,ncol=1)
+  bf_d1.RT = ttestBF(x = int_long[(int_long$outcome_var=="rt" & int_long$Interfering_dim==0),]$interference,
+                      nullInterval = c(-Inf,0)) 
+  BFs_int_RT[1] = bf_d1.RT[2] # BF data | positive interference / data | mu=0
+  bf_d2.RT = ttestBF(x = int_long[(int_long$outcome_var=="rt" & int_long$Interfering_dim==1),]$interference,
+                      nullInterval = c(-Inf,0)) 
+  BFs_int_RT[2] = bf_d2.RT[2] # BF data | positive interference / data | mu=0
+  bf_d3.RT = ttestBF(x = int_long[(int_long$outcome_var=="rt" & int_long$Interfering_dim==2),]$interference,
+                      nullInterval = c(-Inf,0)) 
+  BFs_int_RT[3] = bf_d3.RT[2] # BF data | positive interference / data | mu=0
+  bf_d4.RT = ttestBF(x = int_long[(int_long$outcome_var=="rt" & int_long$Interfering_dim==3),]$interference,
+                      nullInterval = c(-Inf,0)) 
+  BFs_int_RT[4] = bf_d4.RT[2] # BF data | positive interference / data | mu=0
+  BFs_int_acc = matrix(data=NA,nrow=4,ncol=1)
+  bf_d1.acc = ttestBF(x = int_long[(int_long$outcome_var=="ac" & int_long$Interfering_dim=="_0"),]$interference,
+                      nullInterval = c(0,Inf)) 
+  BFs_int_acc[1] = bf_d1.acc[2] # BF data | positive interference / data | mu=0
+  bf_d2.acc = ttestBF(x = int_long[(int_long$outcome_var=="ac" & int_long$Interfering_dim=="_1"),]$interference,
+                      nullInterval = c(0,Inf)) 
+  BFs_int_acc[2] = bf_d2.acc[2] # BF data | positive interference / data | mu=0
+  bf_d3.acc = ttestBF(x = int_long[(int_long$outcome_var=="ac" & int_long$Interfering_dim=="_2"),]$interference,
+                      nullInterval =c(0,Inf)) 
+  BFs_int_acc[3] = bf_d3.acc[2] # BF data | positive interference / data | mu=0
+  bf_d4.acc = ttestBF(x = int_long[(int_long$outcome_var=="ac" & int_long$Interfering_dim=="_3"),]$interference,
+                      nullInterval = c(0,Inf)) 
+  BFs_int_acc[4] = bf_d4.acc[2] # BF data | positive interference / data | mu=0
+  
+print("REPORT: interference effects by non-cued dimension")
+  print(paste("BFs_int_RT:",BFs_int_RT))
+  print(paste("BFs_int_acc:",BFs_int_acc))
+  
+  
+# report 
+  
+formatted_string <- sprintf("all non-cued dimensions produced interference for both response time (color: Bayes Factor (BF) = %.1f, shape: BF = %.1f, edge: BF = %.1f, pattern: BF = %.1f) and accuracy (color: BF = %.1f, shape: BF = %.1f, edge: BF = %.1f, pattern: BF = %.1f)", 
+                            BFs_int_RT[1], BFs_int_RT[2], BFs_int_RT[3], BFs_int_RT[4], 
+                            BFs_int_acc[1], BFs_int_acc[2], BFs_int_acc[3], BFs_int_acc[4])
+
+print(formatted_string)  
+```  
+
+
+  
+Dimension's interference by task and non-cued dimension. Persistence of interference
+```{r Dimensions_interference_by_task, echo=FALSE, message=FALSE}
+  
+print("REPORT: interference effects by non-cued dimension and cued task")
+# every non-cued dimension interferes on every cued dimension (as plotted)
+ints_long = ints%>%
+  pivot_longer(int_rt_0:int_acc_3, names_to = "Interfering_dim", values_to = "interference") %>% # long format - both RTs and ACC
+  mutate(outcome_var = substring(Interfering_dim, first=5, last=6),
+         Interfering_dim = substring(Interfering_dim, first=nchar(Interfering_dim), last=nchar(Interfering_dim)),
+         task_n = factor(task_n, levels = c(0,1,2,3)),
+         Interfering_dim = factor(Interfering_dim)) 
+  ### tests
+  BFs_ints_RT = matrix(data=NA,nrow=4,ncol=4)
+  for (int_dim in as.numeric(unique(ints_long$Interfering_dim))) {
+    for (task_n in as.numeric(unique(ints_long$task_n))) {
+        if (int_dim!=task_n) {
+        x = ints_long[(ints_long$outcome_var=="rt" & ints_long$Interfering_dim==int_dim-1 & ints_long$task_n==task_n-1),]
+        bf = ttestBF(x = x$interference,
+                      nullInterval = c(-Inf,0)) 
+        bf = extractBF(bf, logbf = FALSE, onlybf = FALSE)
+        BFs_ints_RT[int_dim,task_n] = bf$bf[2]
+        }
+    }}
+  print(paste(".  range BFs ints RT - intefering dimension by task:", 
+              formatC(min(BFs_ints_RT, na.rm=TRUE), format = "e", digits = 2),
+              formatC(max(BFs_ints_RT, na.rm=TRUE), format = "e", digits = 2) ))
+  BFs_ints_acc = matrix(data=NA,nrow=4,ncol=4)
+  for (int_dim in as.numeric(unique(ints_long$Interfering_dim))) {
+    for (task_n in as.numeric(unique(ints_long$task_n))) {
+        if (int_dim!=task_n) {
+        x = ints_long[(ints_long$outcome_var=="ac" & ints_long$Interfering_dim==int_dim-1 & ints_long$task_n==task_n-1),]
+        bf = ttestBF(x = x$interference,
+                      nullInterval = c(Inf,0)) # figure edit: with acc int= inc-con, null interval now is positive (was c(-Inf,0))
+        bf = extractBF(bf, logbf = FALSE, onlybf = FALSE)
+        BFs_ints_acc[int_dim,task_n] = bf$bf[2]
+        }
+    }}
+  print(paste(".  range BFs ints accuracy - intefering dimension by task:", 
+              formatC(min(BFs_ints_acc, na.rm=TRUE), format = "e", digits = 2),
+              formatC(max(BFs_ints_acc, na.rm=TRUE), format = "e", digits = 2) ))
+  ###
+
+# number of positive interference effects (per participant)
+n_pos_int = int_long %>%
+            group_by(subid, outcome_var) %>%
+            summarise(n_pos_int = sum(interference>0)) %>%
+            group_by(outcome_var) %>%
+            summarise(mean_pos_int = mean(n_pos_int),
+                      sd_pos_int = sd(n_pos_int)) # group mean of positive interference effects
+  ### test them against null=2.5: 
+  x = int_long %>% group_by(subid, outcome_var) %>% summarise(n_pos_int = sum(interference>0)) %>% filter(outcome_var=="rt") %>% select(n_pos_int)
+  bf_int.RT = ttestBF(x = x$n_pos_int,
+                      paired = FALSE, nullInterval = c(-Inf,2.5)) #, posterior=T, iterations=1000
+  # bf_int.RT
+  bf_int.RT = bf_int.RT[2]/bf_int.RT[1] # positive intererence effects on RT: BF HP(x>2.5) / HP(x<2.5) 
+  x = int_long %>% group_by(subid, outcome_var) %>% summarise(n_pos_int = sum(interference>0)) %>% filter(outcome_var=="ac") %>% select(n_pos_int)
+  bf_int.acc = ttestBF(x = x$n_pos_int,
+                      paired = FALSE, nullInterval = c(-Inf,2.5)) #, posterior=T, iterations=1000
+  # bf_int.acc
+  bf_int.acc = bf_int.acc[2]/bf_int.acc[1] # positive intererence effects on accuracy: BF HP(x>2.5) / HP(x<2.5) 
+
+print("REPORT: number of positive interference effects (per participant)")
+print(n_pos_int)
+print("REPORT: positive intererence effects on RT: BF HP(x>2.5) / HP(x<2.5)")
+print(bf_int.RT)
+print("REPORT: positive intererence effects on accuracy: BF HP(x>2.5) / HP(x<2.5) ")
+print(bf_int.acc)
+
+  ###
+  
+# number of positive adaptation effects (per participant) - c.f. heatmap plot
+pos_adapt_ac = prev_ds_int_delta %>% group_by(prev_ref,subid) %>%
+  summarise(across(everything(), ~(.x<0))) %>% # positive adaptation? (negative accuracy)
+  select(prev_ref,subid,d_int_acc_0:d_int_acc_3) %>%        # select Accuracy
+  as_tibble() %>%
+  pivot_longer(d_int_acc_0:d_int_acc_3, names_to = "Curr_dist", values_to = "adaptation") %>%
+  group_by(subid) %>%
+  mutate(ondiag = prev_ref==substring(Curr_dist, first=11, last=12)) %>%
+  summarise(ondiag_count = sum(adaptation[ondiag]) ) 
+n_pos_adapt_ac  = pos_adapt_ac %>%
+  group_by() %>%
+  summarise(mean_pos_adapt = mean(ondiag_count),
+            sd_pos_adapt = sd(ondiag_count))
+  ### test them against null=2.5: 
+  bf_ada.acc = ttestBF(x = pos_adapt_ac$ondiag_count,
+                      paired = FALSE, nullInterval = c(-Inf,2.5)) #, posterior=T, iterations=1000
+  # bf_ada.acc
+  bf_ada.acc = bf_ada.acc[2]/bf_ada.acc[1] # positive interference effects on accuracy: BF HP(x>2.5) / HP(x<2.5) 
+  # bf_ada.acc
+  ###
+pos_adapt_rt = prev_ds_int_delta %>% group_by(prev_ref,subid) %>%
+  summarise(across(everything(), ~(.x>0))) %>% # positive adaptation?
+  select(prev_ref,subid,d_int_rt_0:d_int_rt_3) %>%        # select RT
+  as_tibble() %>%
+  pivot_longer(d_int_rt_0:d_int_rt_3, names_to = "Curr_dist", values_to = "adaptation") %>%
+  group_by(subid) %>%
+  mutate(ondiag = prev_ref==substring(Curr_dist, first=10, last=11)) %>%
+  summarise(ondiag_count = sum(adaptation[ondiag]) ) 
+n_pos_adapt_rt = pos_adapt_rt %>%
+  group_by() %>%
+  summarise(mean_pos_adapt = mean(ondiag_count),
+            sd_pos_adapt = sd(ondiag_count))
+  ### test them against null=2.5: 
+  bf_ada.RT = ttestBF(x = pos_adapt_rt$ondiag_count,
+                      paired = FALSE, nullInterval = c(-Inf,2.5)) #, posterior=T, iterations=1000
+  # bf_ada.RT
+  bf_ada.RT = bf_ada.RT[2]/bf_ada.RT[1] # positive interference effects on RT: BF HP(x>2.5) / HP(x<2.5) 
+  ###
+  
+print("REPORT: number of positive adaptation effects (per participant)")
+print('. accuracy')
+n_pos_adapt_ac
+print('. RT')
+n_pos_adapt_rt
+print("REPORT: positive adaptation effects on RT: BF HP(x>2.5) / HP(x<2.5)")
+print(bf_ada.RT)
+print("REPORT: positive adaptation effects on accuracy: BF HP(x>2.5) / HP(x<2.5) ")
+print(bf_ada.acc)
+  
+
+  
+  
+# congruency persists over multiple blocks (of repetition of cued dimension)
+persist_0 = data_proc %>%
+        group_by(subid, delays_0) %>%
+        summarise(
+          prs_rt_con = mean(rt[correct==1 & congruency_color==1]),
+          prs_rt_inc = mean(rt[correct==1 & congruency_color==0]),
+          prs_acc_con = mean(correct[congruency_color==1]),
+          prs_acc_inc = mean(correct[congruency_color==0]),
+          ref_dim = 0
+        )
+colnames(persist_0)[2] = "delays"
+persist_1 = data_proc %>%
+        group_by(subid, delays_1) %>%
+        summarise(
+          prs_rt_con = mean(rt[correct==1 & congruency_shape==1]),
+          prs_rt_inc = mean(rt[correct==1 & congruency_shape==0]),
+          prs_acc_con = mean(correct[congruency_shape==1]),
+          prs_acc_inc = mean(correct[congruency_shape==0]),
+          ref_dim = 1
+        ) 
+colnames(persist_1)[2] = "delays"
+persist_2 = data_proc %>%
+        group_by(subid, delays_2) %>%
+        summarise(
+          prs_rt_con = mean(rt[correct==1 & congruency_edge==1]),
+          prs_rt_inc = mean(rt[correct==1 & congruency_edge==0]),
+          prs_acc_con = mean(correct[congruency_edge==1]),
+          prs_acc_inc = mean(correct[congruency_edge==0]),
+          ref_dim = 2
+        )
+colnames(persist_2)[2] = "delays"
+persist_3 = data_proc %>%
+        group_by(subid, delays_3) %>%
+        summarise(
+          prs_rt_con = mean(rt[correct==1 & congruency_pattern==1]),
+          prs_rt_inc = mean(rt[correct==1 & congruency_pattern==0]),
+          prs_acc_con = mean(correct[congruency_pattern==1]),
+          prs_acc_inc = mean(correct[congruency_pattern==0]),
+          ref_dim = 3
+        )
+colnames(persist_3)[2] = "delays"
+persist = rbind(persist_0,persist_1,persist_2,persist_3)
+## summarise group on sbj-level averages
+persist_mu = group_by(persist, delays) %>%    # by ref_dim = by each distractor
+             summarise(across(prs_rt_con:prs_acc_inc, ~mean(.x, na.rm=TRUE)))
+
+  ### tests
+  xy = persist %>% group_by(subid, delays) %>% 
+       summarise(across(prs_rt_con:prs_acc_inc, ~mean(.x, na.rm=TRUE))) %>% # average over ref_dim 
+       pivot_longer(3:6, names_to = "conditions", values_to = "values") # = aggregate interference effects of different non-cued dimensions
+  BFs_pers_RT = matrix(data=NA,nrow=6,ncol=1)
+  bf_pers1.RT = ttestBF(x = xy[(xy$conditions=="prs_rt_con" & xy$delays==1),]$values,
+                        y = xy[(xy$conditions=="prs_rt_inc" & xy$delays==1),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_RT[1] = bf_pers1.RT[2] #BF-0
+  bf_pers2.RT = ttestBF(x = xy[(xy$conditions=="prs_rt_con" & xy$delays==2),]$values,
+                        y = xy[(xy$conditions=="prs_rt_inc" & xy$delays==2),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_RT[2] = bf_pers2.RT[2] #BF-0
+  bf_pers3.RT = ttestBF(x = xy[(xy$conditions=="prs_rt_con" & xy$delays==3),]$values,
+                        y = xy[(xy$conditions=="prs_rt_inc" & xy$delays==3),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_RT[3] = bf_pers3.RT[2] #BF-0
+  bf_pers4.RT = ttestBF(x = xy[(xy$conditions=="prs_rt_con" & xy$delays==4),]$values,
+                        y = xy[(xy$conditions=="prs_rt_inc" & xy$delays==4),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_RT[4] = bf_pers4.RT[2] #BF-0
+  bf_pers5.RT = ttestBF(x = xy[(xy$conditions=="prs_rt_con" & xy$delays==5),]$values,
+                        y = xy[(xy$conditions=="prs_rt_inc" & xy$delays==5),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_RT[5] = bf_pers5.RT[2] #BF-0
+  bf_pers6.RT = ttestBF(x = xy[(xy$conditions=="prs_rt_con" & xy$delays==6),]$values,
+                        y = xy[(xy$conditions=="prs_rt_inc" & xy$delays==6),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  # BFs_pers_RT[6] = bf_pers6.RT[2] #BF-0
+  BFs_pers_acc = matrix(data=NA,nrow=6,ncol=1)
+  bf_pers1.acc = ttestBF(x = xy[(xy$conditions=="prs_acc_con" & xy$delays==1),]$values,
+                        y = xy[(xy$conditions=="prs_acc_inc" & xy$delays==1),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_acc[1] = bf_pers1.acc[1]    #BF+0
+  bf_pers2.acc = ttestBF(x = xy[(xy$conditions=="prs_acc_con" & xy$delays==2),]$values,
+                        y = xy[(xy$conditions=="prs_acc_inc" & xy$delays==2),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_acc[2] = bf_pers2.acc[1]    #BF+0
+  bf_pers3.acc = ttestBF(x = xy[(xy$conditions=="prs_acc_con" & xy$delays==3),]$values,
+                        y = xy[(xy$conditions=="prs_acc_inc" & xy$delays==3),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_acc[3] = bf_pers3.acc[1]    #BF+0
+  bf_pers4.acc = ttestBF(x = xy[(xy$conditions=="prs_acc_con" & xy$delays==4),]$values,
+                        y = xy[(xy$conditions=="prs_acc_inc" & xy$delays==4),]$values,
+                        paired = TRUE, nullInterval = c(0,Inf)) 
+  BFs_pers_acc[4] = bf_pers4.acc[1]    #BF+0
+  
+  
+  
+  
+
+  
+```
+
+
+
+
+
+Parametric congruency (CNG)
+``` {r CNG_bayesian_stats, echo=FALSE, eval=TRUE, tidy = TRUE}
+
+library(brms)
+theme_set(theme_default())
+
+# accuracy
+data = data_proc[data_proc$task_count>1,] # drop switch trials
+prior <- get_prior(correct ~ 1 + sum_congruency,
+                   family = bernoulli(link = "logit"),
+                   data = data)
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("student_t(3, 0, 2.5)", class = "Intercept")
+           )
+fit_CNGa <- brm(correct ~ 1 + sum_congruency + (1 + sum_congruency | subid),
+             family = bernoulli(link = "logit"),
+             prior = prior,
+             data = data,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 3000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "CNGa")
+
+print(fit_CNGa, digits = 3)
+# pp_check(fit_CNGa)
+# plot(fit_CNGa, ask = FALSE)
+# summary(fit_CNGa)
+pm = plot_model(fit_CNGa, type = "est")
+pm 
+
+
+
+
+
+
+# response time
+data_correct = data_proc[data_proc$correct==1,] # for predicting RTs, drop incorrect trials
+data_correct = data_correct[data_correct$task_count>1,] # drop switch trials
+
+prior <- get_prior(rt ~ 1 + sum_congruency,
+                   family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+                   data = data_correct)
+
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("student_t(3, 6.5, 2.5)", class = "Intercept"),
+           set_prior("uniform(0, min_Y)", class = "ndt", lb="0", ub="min_Y"),
+           set_prior("student_t(3, 0, 2.5)", class = "sigma", lb="0")
+           )
+
+
+fit_CNGrt <- brm(rt ~ 1 + sum_congruency + (1 + sum_congruency | subid),
+             family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+             prior = prior,
+             data = data_correct,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 3000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "CNGrt")
+
+
+
+print(fit_CNGrt, digits = 3)
+# pp_check(fit_CNGrt)
+# plot(fit_CNGrt, ask = FALSE)
+# summary(fit_CNGrt)
+pm = plot_model(fit_CNGrt, type = "est")
+pm + ylim(0.9, 1.1)
+
+# estimated marginal effect (response scale)
+conditional_effects(fit_CNGrt)
+# to extract estimates in raw ms
+# fitted(fit_CNGrt, summary = TRUE)
+
+```
+
+CNG report
+---------------
+```{r CNG_bayesian_report, echo=FALSE, eval=TRUE, tidy = TRUE}
+
+# accuracy
+bayestestR::describe_posterior(fit_CNGa)
+brms::hypothesis(fit_CNGa,"sum_congruency>0")
+# pass into emmeans to revert from logit to response scale (probabilities)
+rg_fit <- ref_grid(fit_CNGa, epred = TRUE, at = list(sum_congruency = c(0,1,2,3)))
+em <- emmeans(rg_fit, specs = ~sum_congruency, type='response') # marginal means at the 4 values of sum_congruency
+sem = summary(em)
+# plot marginal means' distributions, on draws extracted with tidybayes
+CNG_0 = gather_emmeans_draws(em) %>% filter(sum_congruency==0) %>% pull(.value) 
+CNG_1 = gather_emmeans_draws(em) %>% filter(sum_congruency==1) %>% pull(.value) 
+CNG_2 = gather_emmeans_draws(em) %>% filter(sum_congruency==2) %>% pull(.value) 
+CNG_3 = gather_emmeans_draws(em) %>% filter(sum_congruency==3) %>% pull(.value) 
+library(viridis)
+ggplot(as.data.frame(cbind(CNG_0,CNG_1,CNG_2,CNG_3))%>%pivot_longer(1:4, names_to = "CNG", values_to = "Accuracy"), aes(x = Accuracy, group = CNG, fill = CNG)) +
+  geom_density(adjust = 1.5, alpha=.4) + 
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  labs(title="", x = "Accuracy", y = "Density", fill = "# congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(0.8, 0.3),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.x=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18)) +
+  coord_flip()
+# contrasts along sum_congruency (ER: testing 0 lower than 1 than 2 etc, vs opposite)
+rope_value = 0.1*sd(data$correct) # 1/10 SD of the response variable - a “negligible” effect size (Cohen, 1988)
+rope_range <- c(-rope_value, rope_value)
+ER_01 = mean(CNG_0-CNG_1<0) / mean(CNG_0-CNG_1>=0)
+HDI_01 = bayestestR::hdi(CNG_0-CNG_1, ci = 0.95)
+rope_01 = bayestestR::rope(CNG_0-CNG_1, range = rope_range, ci = 0.89)
+ER_12 = mean(CNG_1-CNG_2<0) / mean(CNG_1-CNG_2>=0)
+HDI_12 = bayestestR::hdi(CNG_1-CNG_2, ci = 0.95)
+rope_12 = bayestestR::rope(CNG_1-CNG_2, range = rope_range, ci = 0.89)
+ER_23 = mean(CNG_2-CNG_3<0) / mean(CNG_2-CNG_3>=0)
+HDI_23 = bayestestR::hdi(CNG_2-CNG_3, ci = 0.95)
+rope_23 = bayestestR::rope(CNG_2-CNG_3, range = rope_range, ci = 0.89) # oddly within the rope, cause close values, but clearly different distributions
+CNGacc.list = list(c(mean(CNG_0),mean(CNG_1),mean(CNG_2),mean(CNG_3)), rbind(hdi(CNG_0),hdi(CNG_1),hdi(CNG_2),hdi(CNG_3)), c("01", "12", "23"), rbind(ER_01, ER_12, ER_23), rbind(HDI_01, HDI_12, HDI_23), rbind(rope_01, rope_12, rope_23))
+
+
+
+
+
+
+
+# RT
+bayestestR::describe_posterior(fit_CNGrt)
+brms::hypothesis(fit_CNGrt,"sum_congruency<0")
+# pass into emmeans to revert from exgaussian to response scale 
+rg_fit <- ref_grid(fit_CNGrt, epred = TRUE, at = list(sum_congruency = c(0,1,2,3)))
+em <- emmeans(rg_fit, specs = ~sum_congruency, type='response') # marginal means at the 4 values of sum_congruency
+sem = summary(em)
+# plot marginal means' distributions, on draws extracted with tidybayes
+CNG_0 = gather_emmeans_draws(em) %>% filter(sum_congruency==0) %>% pull(.value) 
+CNG_1 = gather_emmeans_draws(em) %>% filter(sum_congruency==1) %>% pull(.value) 
+CNG_2 = gather_emmeans_draws(em) %>% filter(sum_congruency==2) %>% pull(.value) 
+CNG_3 = gather_emmeans_draws(em) %>% filter(sum_congruency==3) %>% pull(.value) 
+library(viridis)
+ggplot(as.data.frame(cbind(CNG_0,CNG_1,CNG_2,CNG_3))%>%
+         pivot_longer(1:4, names_to = "CNG", values_to = "RT"), aes(x = RT, group = CNG, fill = CNG)) +
+  geom_density(adjust = 1.5, alpha=.4) + 
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  labs(title="", x = "Response time (ms)", y = "Density", fill = "# congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(0.9, 0.9),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.x=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18)) +
+  coord_flip()
+# contrasts along sum_congruency (ER: testing 0 higher than 1 than 2 etc, vs opposite)
+rope_value = 0.1*sd(data_correct$rt) # 1/10 SD of the response variable - a “negligible” effect size (Cohen, 1988) -- but it is questionable to rely on response SD that includes sbj variability
+rope_range <- c(-rope_value, rope_value)
+ER_01 = mean(CNG_0-CNG_1>0) / mean(CNG_0-CNG_1<=0)
+HDI_01 = bayestestR::hdi(CNG_0-CNG_1, ci = 0.95)
+rope_01 = bayestestR::rope(CNG_0-CNG_1, range = rope_range, ci = 0.89)
+ER_12 = mean(CNG_1-CNG_2>0) / mean(CNG_1-CNG_2<=0)
+HDI_12 = bayestestR::hdi(CNG_1-CNG_2, ci = 0.95)
+rope_12 = bayestestR::rope(CNG_1-CNG_2, range = rope_range, ci = 0.89)
+ER_23 = mean(CNG_2-CNG_3>0) / mean(CNG_2-CNG_3<=0)
+HDI_23 = bayestestR::hdi(CNG_2-CNG_3, ci = 0.95)
+rope_23 = bayestestR::rope(CNG_2-CNG_3, range = rope_range, ci = 0.89)
+CNGrt.list = list(c(mean(CNG_0),mean(CNG_1),mean(CNG_2),mean(CNG_3)), rbind(hdi(CNG_0),hdi(CNG_1),hdi(CNG_2),hdi(CNG_3)), c("01", "12", "23"), rbind(ER_01, ER_12, ER_23), rbind(HDI_01, HDI_12, HDI_23), rbind(rope_01, rope_12, rope_23))
+
+
+# correlation bw random effects of CNG on RT and Accuracy
+ACCrnd = ranef(
+  fit_CNGa,
+  summary = TRUE,
+  robust = TRUE, # TRUE: median of posterior estimates
+  pars = "sum_congruency",
+  groups = NULL
+) 
+RTrnd = ranef(
+  fit_CNGrt,
+  summary = TRUE,
+  robust = TRUE, # TRUE: median of posterior estimates
+  pars = "sum_congruency",
+  groups = NULL
+) 
+ACCrnd_means = ACCrnd$subid[ , 1, 1] # random slopes for CNG effect on accuracy
+RTrnd_means = RTrnd$subid[ , 1, 1] # random slopes for CNG effect on reaction time (in log space)
+plot(ACCrnd_means,RTrnd_means)
+r = cor.test(ACCrnd_means,RTrnd_means)
+r
+
+# print results
+CNGacc.list
+CNGrt.list
+
+
+
+
+# report
+formatted_string <- sprintf("Participants were fastest and most accurate when the stimulus was fully congruent and became slower and less accurate with each decrease in the number of congruent dimensions (RT: M3 = %.0f ms, M2 = %.0f ms, M1 = %.0f ms, M0 = %.0f ms; accuracy: M3 = %.1f%%, M2 = %.1f%%, M1 = %.1f%%, M0 = %.1f%%).", 
+                            CNGrt.list[[1]][4], CNGrt.list[[1]][3], CNGrt.list[[1]][2], CNGrt.list[[1]][1], 
+                            CNGacc.list[[1]][4]*100, CNGacc.list[[1]][3]*100, CNGacc.list[[1]][2]*100, CNGacc.list[[1]][1]*100)
+
+print(formatted_string)  
+```
+
+
+
+
+
+``` {r CSE_spgtti_bayesian_stats, echo=FALSE}
+
+library(brms)
+theme_set(theme_default())
+
+# accuracy
+data = data_proc[data_proc$task_count>1,] # drop switch trials
+prior <- get_prior(correct ~ 1 + sum_congruency*previous_sum_congruency,
+                   family = bernoulli(link = "logit"),
+                   data = data)
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "previous_sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "sum_congruency:previous_sum_congruency"),
+           set_prior("student_t(3, 0, 2.5)", class = "Intercept")
+           )
+fit_CSEspga <- brm(correct ~ 1 + sum_congruency*previous_sum_congruency + (1 | subid), 
+             family = bernoulli(link = "logit"),
+             prior = prior,
+             data = data,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 3000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "CSEspga")
+
+
+# response time
+data_correct = data_proc[data_proc$correct==1,] # for predicting RTs, drop incorrect trials
+data_correct = data_correct[data_correct$task_count>1,] # drop switch trials
+
+
+prior <- get_prior(rt ~ 1 + sum_congruency*previous_sum_congruency,
+                   family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+                   data = data_correct)
+
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "previous_sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "sum_congruency:previous_sum_congruency"),
+           set_prior("student_t(3, 6.5, 2.5)", class = "Intercept"),
+           set_prior("uniform(0, min_Y)", class = "ndt", lb="0", ub="min_Y"),
+           set_prior("student_t(3, 0, 2.5)", class = "sigma", lb="0")
+           )
+
+
+fit_CSEspgrt <- brm(rt ~ 1 + sum_congruency*previous_sum_congruency + (1 | subid),
+             family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+             prior = prior,
+             data = data_correct,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 3000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "CSEspgrt")
+
+
+
+print(fit_CSEspgrt, digits = 3)
+# pp_check(fit_CSEspgrt)
+plot(fit_CSEspgrt, ask = FALSE)
+# summary(fit_CSEspgrt)
+pm = plot_model(fit_CSEspgrt, type = "est", epred=TRUE, scale="response")
+pm + ylim(0.9, 1.1)
+```
+
+CSE spaghetti report
+---------------
+```{r CSE_spgtti_bayesian_report, echo=FALSE}
+print("Accuracy")
+# Accuracy
+bayestestR::describe_posterior(fit_CSEspga)
+brms::hypothesis(fit_CSEspga,"sum_congruency>0")
+brms::hypothesis(fit_CSEspga,"previous_sum_congruency<0")
+brms::hypothesis(fit_CSEspga,"sum_congruency:previous_sum_congruency>0")
+# pass into emmeans to revert from logit to response scale (probabilities)
+rg_fit <- ref_grid(fit_CSEspga, epred = TRUE, at = list(sum_congruency = c(0,1,2,3), previous_sum_congruency = c(0,1,2,3)))
+em <- emmeans(rg_fit, specs = ~sum_congruency*previous_sum_congruency, type='response') # marginal means at the 4 values of sum_congruency : 4 values of previous_sum_congruency
+sem = summary(em)
+# plot marginal means' distributions, on draws extracted with tidybayes
+CSE_00 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_01 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_02 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_03 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_10 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_11 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_12 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_13 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_20 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_21 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_22 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_23 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_30 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==3) %>% pull(.value) 
+CSE_31 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==3) %>% pull(.value) 
+CSE_32 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==3) %>% pull(.value) 
+CSE_33 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==3) %>% pull(.value) 
+library(viridis)
+ggplot(as.data.frame(cbind(CSE_00,CSE_01,CSE_02,CSE_03,
+                           CSE_10,CSE_11,CSE_12,CSE_13,
+                           CSE_20,CSE_21,CSE_22,CSE_23,
+                           CSE_30,CSE_31,CSE_32,CSE_33))%>%
+         pivot_longer(1:16, names_to = "CSE", values_to = "Accuracy")%>%
+                  arrange(CSE)%>% # default is ascending
+                  mutate(prev_cong = as.factor(rep(c(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3), each = n()/16)),
+                         cur_cong = as.factor(rep(c(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3), each = n()/16))),
+       aes(x = Accuracy, group = cur_cong, fill = cur_cong)) +
+  geom_density(adjust = 1.5, alpha=.4) + 
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  facet_grid(prev_cong ~ ., labeller = labeller(prev_cong = c(0,1,2,3))) +
+  labs(tag="# previous congruent dimensions", x = "Accuracy", y = "Density", fill = "# congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(-0.01, 0.82),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.y=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18),
+        plot.tag=element_text(angle=-90),
+        plot.margin = unit(c(0.5,1,0.5,1), "cm"),
+        plot.tag.position=c(1.02, 0.55),
+        axis.title.y = element_text(hjust = 0.4),
+        strip.text.y = element_text(size = 12))
+# example of contrasts along sum_congruency (extreme only) by previous_sum_congruency
+rope_value = 0.1*sd(data$correct) # 1/10 SD of the response variable - a “negligible” effect size (Cohen, 1988) -- but it is questionable to rely on response SD that includes sbj variability
+rope_range <- c(-rope_value, rope_value)
+ER_0003 = mean(CSE_00-CSE_03<0) / mean(CSE_00-CSE_03>=0) # == main effect CNG
+HDI_0003 = bayestestR::hdi(CSE_00-CSE_03, ci = 0.95)
+rope_0003 = bayestestR::rope(CSE_00-CSE_03, range = rope_range, ci = 0.89)
+# Report the extreme-condition and simple-effect contrasts.
+CSEacc.list = list(c("00", "03", "30", "33"),
+                  c(mean(CSE_00),mean(CSE_03),mean(CSE_30),mean(CSE_33)),
+                  rbind(hdi(CSE_00),hdi(CSE_03),hdi(CSE_30),hdi(CSE_33)))
+CSEacc_contrast.list = list(c("30-00", "33-03", "00-03", "30-33"),
+                           rbind(mean(CSE_30-CSE_00),mean(CSE_33-CSE_03),mean(CSE_00-CSE_03),mean(CSE_30-CSE_33)),
+                           rbind(hdi(CSE_30-CSE_00),hdi(CSE_33-CSE_03),hdi(CSE_00-CSE_03),hdi(CSE_30-CSE_33)))
+# Evidence ratios for the simple contrasts.
+ERs_acc = list(c("00-03", "30-33"),
+               c(mean(CSE_00-CSE_03<0) / mean(CSE_00-CSE_03>=0),
+                 mean(CSE_30-CSE_33<0) / mean(CSE_30-CSE_33>=0)))
+
+
+print("RT")
+# RT
+bayestestR::describe_posterior(fit_CSEspgrt)
+brms::hypothesis(fit_CSEspgrt,"sum_congruency<0")
+brms::hypothesis(fit_CSEspgrt,"previous_sum_congruency>0")
+brms::hypothesis(fit_CSEspgrt,"sum_congruency:previous_sum_congruency<0")
+# pass into emmeans to revert from exgaussian to response scale 
+rg_fit <- ref_grid(fit_CSEspgrt, epred = TRUE, at = list(sum_congruency = c(0,1,2,3), previous_sum_congruency = c(0,1,2,3)))
+em <- emmeans(rg_fit, specs = ~sum_congruency*previous_sum_congruency, type='response') # marginal means at the 4 values of sum_congruency : 4 values of previous_sum_congruency
+sem = summary(em)
+# plot marginal means' distributions, on draws extracted with tidybayes
+CSE_00 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_01 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_02 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_03 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==0) %>% pull(.value) 
+CSE_10 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_11 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_12 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_13 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==1) %>% pull(.value) 
+CSE_20 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_21 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_22 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_23 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==2) %>% pull(.value) 
+CSE_30 = gather_emmeans_draws(em) %>% filter(sum_congruency==0 & previous_sum_congruency==3) %>% pull(.value) 
+CSE_31 = gather_emmeans_draws(em) %>% filter(sum_congruency==1 & previous_sum_congruency==3) %>% pull(.value) 
+CSE_32 = gather_emmeans_draws(em) %>% filter(sum_congruency==2 & previous_sum_congruency==3) %>% pull(.value) 
+CSE_33 = gather_emmeans_draws(em) %>% filter(sum_congruency==3 & previous_sum_congruency==3) %>% pull(.value) 
+library(viridis)
+ggplot(as.data.frame(cbind(CSE_00,CSE_01,CSE_02,CSE_03,
+                           CSE_10,CSE_11,CSE_12,CSE_13,
+                           CSE_20,CSE_21,CSE_22,CSE_23,
+                           CSE_30,CSE_31,CSE_32,CSE_33))%>%
+         pivot_longer(1:16, names_to = "CSE", values_to = "RT")%>%
+                  arrange(CSE)%>% # default is ascending
+                  mutate(prev_cong = as.factor(rep(c(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3), each = n()/16)),
+                         cur_cong = as.factor(rep(c(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3), each = n()/16))),
+       aes(x = RT, group = cur_cong, fill = cur_cong)) +
+  geom_density(adjust = 1.5, alpha=.4) + 
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  facet_grid(prev_cong ~ ., labeller = labeller(prev_cong = c(0,1,2,3))) +
+  labs(tag="# previous congruent dimensions", x = "Response time (ms)", y = "Density", fill = "# congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(-0.01, 0.82),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.y=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18),
+        plot.tag=element_text(angle=-90),
+        plot.margin = unit(c(0.5,1,0.5,1), "cm"),
+        plot.tag.position=c(1.02, 0.55),
+        axis.title.y = element_text(hjust = 0.4),
+        strip.text.y = element_text(size = 12))
+# example of contrasts along sum_congruency (extreme only) by previous_sum_congruency
+rope_value = 0.1*sd(data_correct$rt) # 1/10 SD of the response variable - a “negligible” effect size (Cohen, 1988) -- but it is questionable to rely on response SD that includes sbj variability
+rope_range <- c(-rope_value, rope_value)
+ER_0003 = mean(CSE_00-CSE_03>0) / mean(CSE_00-CSE_03<=0) # == main effect CNG
+HDI_0003 = bayestestR::hdi(CSE_00-CSE_03, ci = 0.95)
+rope_0003 = bayestestR::rope(CSE_00-CSE_03, range = rope_range, ci = 0.89)
+# Report the extreme-condition and simple-effect contrasts.
+CSErt.list = list(c("00", "03", "30", "33"),
+                  c(mean(CSE_00),mean(CSE_03),mean(CSE_30),mean(CSE_33)),
+                  rbind(hdi(CSE_00),hdi(CSE_03),hdi(CSE_30),hdi(CSE_33)))
+CSErt_contrast.list = list(c("30-00", "33-03", "00-03", "30-33"),
+                           rbind(mean(CSE_30-CSE_00),mean(CSE_33-CSE_03),mean(CSE_00-CSE_03),mean(CSE_30-CSE_33)),
+                           rbind(hdi(CSE_30-CSE_00),hdi(CSE_33-CSE_03),hdi(CSE_00-CSE_03),hdi(CSE_30-CSE_33)))
+# Evidence ratios for the simple contrasts.
+ERs_rt = list(c("00-03", "30-33"),
+               c(mean(CSE_00-CSE_03>0) / mean(CSE_00-CSE_03<=0),
+                 mean(CSE_30-CSE_33>0) / mean(CSE_30-CSE_33<=0)))
+
+# print results
+# accuracy
+CSEacc.list
+CSEacc_contrast.list
+ERs_acc
+
+#rt
+CSErt.list
+CSErt_contrast.list
+ERs_rt
+
+
+# report
+formatted_string <- sprintf("Compared with trials following fully incongruent trials, trials following fully congruent trials showed strong interference when current congruency was low, leading to longer RTs and lower accuracy (M30-00 = %.0f ms, %.1f%%) and strong facilitation when current congruency was high (leading to shorter RTs and higher accuracy; M33-03 = %.0f ms, %.1f%%).", 
+                            CSErt_contrast.list[[2]][1], CSEacc_contrast.list[[2]][1]*100, CSErt_contrast.list[[2]][2], CSEacc_contrast.list[[2]][2]*100)
+
+print(formatted_string)
+
+```
+
+
+
+
+
+
+
+
+
+``` {r CSE_bayesian_trialaverage, echo=FALSE}
+
+# CSE specificity on trial aggregate
+
+# RTs
+CSE_aggregate1 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_rt_0, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_rt_0[(prev_ref==0)]),
+            offdiag = mean(d_int_rt_0[(prev_ref!=0)]))
+bf.RT = ttestBF(x = CSE_aggregate1$ondiag,
+                y = CSE_aggregate1$offdiag,
+                paired = TRUE, nullInterval = c(0,Inf)) #, posterior=T, iterations=1000
+current_color = as.data.frame(bf.RT)
+current_color_off = as.data.frame(ttestBF(x = CSE_aggregate1$offdiag))
+bf_color_off.RT = as.data.frame(1/ttestBF(x = CSE_aggregate1$offdiag)) #, posterior=T, iterations=1000
+
+rope(bf.RT, ci = c(.90, .95))
+  
+CSE_aggregate2 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_rt_1, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_rt_1[(prev_ref==1)]),
+            offdiag = mean(d_int_rt_1[(prev_ref!=1)]))
+bf.RT = ttestBF(x = CSE_aggregate2$ondiag,
+                y = CSE_aggregate2$offdiag,
+                paired = TRUE, nullInterval = c(0,Inf)) #, posterior=T, iterations=1000
+current_shape = as.data.frame(bf.RT)
+current_shape_off = as.data.frame(ttestBF(x = CSE_aggregate2$offdiag))
+bf_shape_off.RT = as.data.frame(1/ttestBF(x = CSE_aggregate2$offdiag)) #, posterior=T, iterations=1000
+
+CSE_aggregate3 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_rt_2, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_rt_2[(prev_ref==2)]),
+            offdiag = mean(d_int_rt_2[(prev_ref!=2)]))
+bf.RT = ttestBF(x = CSE_aggregate3$ondiag,
+                y = CSE_aggregate3$offdiag,
+                paired = TRUE, nullInterval = c(0,Inf)) #, posterior=T, iterations=1000
+current_edge = as.data.frame(bf.RT)
+current_edge_off = as.data.frame(ttestBF(x = CSE_aggregate3$offdiag))
+bf_edge_off.RT = as.data.frame(1/ttestBF(x = CSE_aggregate3$offdiag)) #, posterior=T, iterations=1000
+
+CSE_aggregate4 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_rt_3, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_rt_3[(prev_ref==3)]),
+            offdiag = mean(d_int_rt_3[(prev_ref!=3)]))
+bf.RT = ttestBF(x = CSE_aggregate4$ondiag,
+                y = CSE_aggregate4$offdiag,
+                paired = TRUE, nullInterval = c(0,Inf)) #, posterior=T, iterations=1000
+current_pattern = as.data.frame(bf.RT)
+current_pattern_off = as.data.frame(ttestBF(x = CSE_aggregate4$offdiag))
+bf_pattern_off.RT = as.data.frame(1/ttestBF(x = CSE_aggregate4$offdiag)) #, posterior=T, iterations=1000
+
+
+# barplot for CSE specificity on trial aggregate
+CSE_aggregates = rbind(
+  CSE_aggregate1 %>% mutate(cur_ncd = Labels[1]), # current non cued dimension
+  CSE_aggregate2 %>% mutate(cur_ncd = Labels[2]),
+  CSE_aggregate3 %>% mutate(cur_ncd = Labels[3]),
+  CSE_aggregate4 %>% mutate(cur_ncd = Labels[4])
+)
+x9 = CSE_aggregates%>%
+  pivot_longer(ondiag:offdiag, names_to = "on_off", values_to = "adaptation") %>% # long format
+  mutate(on_off = factor(on_off, levels = c("ondiag", "offdiag"), labels = c("within", "across")),
+         cur_ncd = factor(cur_ncd, levels = (rev(Labels)))) %>% # reorder according to Labels order
+  summarySEwithin(measurevar="adaptation", withinvars=c("on_off", "cur_ncd"), 
+                  idvar="subid", na.rm=TRUE, conf.interval=.95) %>%
+  ggplot(aes(x=cur_ncd, y=adaptation, fill=on_off)) + 
+  geom_bar(stat="identity", position="dodge", width=0.8) +
+  scale_fill_viridis(discrete = T, name = "Sequence\ntype", # figure edit
+                     begin = 0.1,
+                     end = 0.4,
+                     option="plasma") +
+  # geom_text(aes(label=round(adaptation,0)), color="black", size=3.5, position = position_dodge(width = .9)) +
+  theme_classic() + 
+  geom_errorbar(aes(ymin=adaptation-se, ymax=adaptation+se), width=0.8, position="dodge") +
+  labs(x="Current non-cued dimension", y = "Adaptation (ms)") + # figure edit: dropped title="Reaction time", 
+  theme(axis.text = element_text(size = 15), # figure edit
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip()
+x9
+# ggsave(plot = x9, width = 8, height = 5, dpi = 300, filename = "EEG_specificity_rt.pdf")
+
+
+
+# Accuracy
+CSE_aggregate1 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_acc_0, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_acc_0[(prev_ref==0)]),
+            offdiag = mean(d_int_acc_0[(prev_ref!=0)]))
+bf.acc = ttestBF(x = CSE_aggregate1$ondiag,
+                y = CSE_aggregate1$offdiag,
+                paired = TRUE, nullInterval = c(-Inf,0)) #, posterior=T, iterations=1000
+current_color_ac = as.data.frame(bf.acc)
+current_color_off_ac = as.data.frame(ttestBF(x = CSE_aggregate1$offdiag))
+bf_color_off.acc = as.data.frame(1/ttestBF(x = CSE_aggregate1$offdiag)) #, posterior=T, iterations=1000
+
+rope(bf.acc, ci = c(.90, .95))
+  
+CSE_aggregate2 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_acc_1, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_acc_1[(prev_ref==1)]),
+            offdiag = mean(d_int_acc_1[(prev_ref!=1)]))
+bf.acc = ttestBF(x = CSE_aggregate2$ondiag,
+                y = CSE_aggregate2$offdiag,
+                paired = TRUE, nullInterval = c(-Inf,0)) #, posterior=T, iterations=1000
+current_shape_ac = as.data.frame(bf.acc)
+current_shape_off_ac = as.data.frame(ttestBF(x = CSE_aggregate2$offdiag))
+bf_shape_off.acc = as.data.frame(1/ttestBF(x = CSE_aggregate2$offdiag)) #, posterior=T, iterations=1000
+
+CSE_aggregate3 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_acc_2, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_acc_2[(prev_ref==2)]),
+            offdiag = mean(d_int_acc_2[(prev_ref!=2)]))
+bf.acc = ttestBF(x = CSE_aggregate3$ondiag,
+                y = CSE_aggregate3$offdiag,
+                paired = TRUE, nullInterval = c(-Inf,0)) #, posterior=T, iterations=1000
+current_edge_ac = as.data.frame(bf.acc)
+current_edge_off_ac = as.data.frame(ttestBF(x = CSE_aggregate3$offdiag))
+bf_edge_off.acc = as.data.frame(1/ttestBF(x = CSE_aggregate3$offdiag)) #, posterior=T, iterations=1000
+
+CSE_aggregate4 = prev_ds_int_delta %>%
+  group_by(subid) %>%
+  select(d_int_acc_3, prev_ref, subid) %>%
+  summarise(ondiag = mean(d_int_acc_3[(prev_ref==3)]),
+            offdiag = mean(d_int_acc_3[(prev_ref!=3)]))
+bf.acc = ttestBF(x = CSE_aggregate4$ondiag,
+                y = CSE_aggregate4$offdiag,
+                paired = TRUE, nullInterval = c(-Inf,0)) #, posterior=T, iterations=1000
+current_pattern_ac = as.data.frame(bf.acc)
+current_pattern_off_ac = as.data.frame(ttestBF(x = CSE_aggregate4$offdiag))
+bf_pattern_off.acc = as.data.frame(1/ttestBF(x = CSE_aggregate4$offdiag)) #, posterior=T, iterations=1000
+
+
+# barplot for CSE specificity on trial aggregate
+CSE_aggregates = rbind(
+  CSE_aggregate1 %>% mutate(cur_ncd = Labels[1]), # current non cued dimension
+  CSE_aggregate2 %>% mutate(cur_ncd = Labels[2]),
+  CSE_aggregate3 %>% mutate(cur_ncd = Labels[3]),
+  CSE_aggregate4 %>% mutate(cur_ncd = Labels[4])
+)
+x10 = CSE_aggregates%>%
+  pivot_longer(ondiag:offdiag, names_to = "on_off", values_to = "adaptation") %>% # long format
+  mutate(on_off = factor(on_off, levels = c("ondiag", "offdiag"), labels = c("within", "across")),
+         cur_ncd = factor(cur_ncd, levels = (rev(Labels)))) %>% # reorder according to Labels order
+  summarySEwithin(measurevar="adaptation", withinvars=c("on_off", "cur_ncd"), 
+                  idvar="subid", na.rm=TRUE, conf.interval=.95) %>%
+  ggplot(aes(x=cur_ncd, y=adaptation, fill=on_off)) + 
+  geom_bar(stat="identity", position="dodge", width=0.8) +
+  scale_fill_viridis(discrete = T, name = "Sequence\ntype", # figure edit
+                     begin = 0.6,
+                     end = 0.9,
+                     option="rocket") +
+  # geom_text(aes(label=round(adaptation,0)), color="black", size=3.5, position = position_dodge(width = .9)) +
+  theme_classic() + 
+  geom_errorbar(aes(ymin=adaptation-se, ymax=adaptation+se), width=0.8, position="dodge") +
+  scale_y_continuous(labels = mult_format()) + # figure edit
+  labs(x="Current non-cued dimension", y = "Adaptation (%)") + # figure edit: dropped title="Accuracy",
+  theme(axis.text = element_text(size = 15), # figure edit
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip()
+x10
+# ggsave(plot = x10, width = 8, height = 5, dpi = 300, filename = "EEG_specificity_acc.pdf")
+
+
+
+
+
+```
+
+CSE trialaverage report
+---------------
+``` {r CSE_bayesian_trialaverage_report, echo=TRUE}
+
+# print results
+# RT
+  # color
+current_color$dim = 'color'
+bf_color_off.RT$dim = 'color'
+current_color_off$dim = 'color'
+  # shape
+current_shape$dim = 'shape'
+bf_shape_off.RT$dim = 'shape'
+current_shape_off$dim = 'shape'
+   # edge
+current_edge$dim = 'edge'
+bf_edge_off.RT$dim = 'edge'
+current_edge_off$dim = 'edge'
+   # pattern
+current_pattern$dim = 'pattern'
+bf_pattern_off.RT$dim = 'pattern'
+current_pattern_off$dim = 'pattern'
+
+# accuracy
+  # color
+current_color_ac$dim = 'color'
+bf_color_off.acc$dim = 'color'
+current_color_off_ac$dim = 'color'
+  # shape
+current_shape_ac$dim = 'shape'
+bf_shape_off.acc$dim = 'shape'
+current_shape_off_ac$dim = 'shape'
+   # edge
+current_edge_ac$dim = 'edge'
+bf_edge_off.acc$dim = 'edge'
+current_edge_off_ac$dim = 'edge'
+   # pattern
+current_pattern_ac$dim = 'pattern'
+bf_pattern_off.acc$dim = 'pattern'
+current_pattern_off_ac$dim = 'pattern'
+
+rt_adaptation_df=rbind(current_color[1,],current_shape[1,],current_edge[1,],current_pattern[1,])
+acc_adaptation_df=rbind(current_color_ac[1,],current_shape_ac[1,],current_edge_ac[1,],current_pattern_ac[1,])
+
+rt_adaptation_one_over_off_df=rbind(bf_color_off.RT[1,],bf_shape_off.RT[1,],bf_edge_off.RT[1,],bf_pattern_off.RT[1,])
+acc_adaptation_one_over_off_df=rbind(bf_color_off.acc[1,],bf_shape_off.acc[1,],bf_edge_off.acc[1,],bf_pattern_off.acc[1,])
+
+rt_adaptation_off_df=rbind(current_color_off[1,],current_shape_off[1,],current_edge_off[1,],current_pattern_off[1,])
+acc_adaptation_off_df=rbind(current_color_off_ac[1,],current_shape_off_ac[1,],current_edge_off_ac[1,],current_pattern_off_ac[1,])
+
+# report
+  
+formatted_string <- sprintf("When comparing each within-dimension adaptation effect to an average across-dimension adaptation effect, we observed strong evidence for larger within-dimension compared to across-dimension adaptation effects for the dimension color (RT: BF = %.1f, accuracy: BF = %.1f), shape (RT: BF = %.1f, accuracy: BF = %.1f), edge (RT: BF = %.1f, accuracy: BF = %.1f), but not for pattern (RT: BF = %.1f, accuracy: BF = %.1f). Moreover, we did not find evidence for any across-dimension adaptation effects (RT: range BFs = %.1f - %.1f, accuracy: range BFs = %.1f - %.1f).", 
+                            rt_adaptation_df$bf[1], acc_adaptation_df$bf[1], 
+                            rt_adaptation_df$bf[2], acc_adaptation_df$bf[2], 
+                            rt_adaptation_df$bf[3], acc_adaptation_df$bf[3], 
+                            rt_adaptation_df$bf[4], acc_adaptation_df$bf[4], 
+                            min(rt_adaptation_off_df$bf), max(rt_adaptation_off_df$bf),
+                            min(acc_adaptation_off_df$bf), max(acc_adaptation_off_df$bf)
+                            )
+
+print(formatted_string)  
+```
+``` {r PC_spgtti_bayesian_stats, echo=FALSE}
+
+library(brms)
+theme_set(theme_default())
+
+# accuracy
+data = data_proc %>% # include switch trials -> removed: [data_proc$task_count>1,]
+  mutate(PC_ordinal = (((pc)*3)-1.5)*2) # scale to -1 0 1 (MI, Neu, MC)
+
+prior <- get_prior(correct ~ 1 + sum_congruency*PC_ordinal,
+                   family = bernoulli(link = "logit"),
+                   data = data)
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "PC_ordinal"),
+           set_prior("normal(0,3)", class = "b", coef = "sum_congruency:PC_ordinal"),
+           set_prior("student_t(3, 0, 2.5)", class = "Intercept")
+           )
+fit_PCspga <- brm(correct ~ 1 + sum_congruency*PC_ordinal + (1 + sum_congruency*PC_ordinal | subid), 
+             family = bernoulli(link = "logit"),
+             prior = prior,
+             data = data,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 3000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "PCspga")
+
+
+# response time
+data_correct = data_proc[data_proc$correct==1,] # for predicting RTs, drop incorrect trials
+data_correct = data_correct %>% # include switch trials -> removed: [data_correct$task_count>1,]
+                mutate(PC_ordinal = (((pc)*3)-1.5)*2) # scale to -1 0 1 (MI, Neu, MC)
+
+
+prior <- get_prior(rt ~ 1 + sum_congruency*PC_ordinal,
+                   family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+                   data = data_correct)
+
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "PC_ordinal"),
+           set_prior("normal(0,3)", class = "b", coef = "sum_congruency:PC_ordinal"),
+           set_prior("student_t(3, 6.5, 2.5)", class = "Intercept"),
+           set_prior("uniform(0, min_Y)", class = "ndt", lb="0", ub="min_Y"),
+           set_prior("student_t(3, 0, 2.5)", class = "sigma", lb="0")
+           )
+
+
+fit_PCspgrt <- brm(rt ~ 1 + sum_congruency*PC_ordinal + (1 + sum_congruency*PC_ordinal | subid),
+             family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+             prior = prior,
+             data = data_correct,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 3000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "PCspgrt")
+
+
+
+print(fit_PCspgrt, digits = 3)
+# pp_check(fit_PCspgrt)
+plot(fit_PCspgrt, ask = FALSE)
+# summary(fit_PCspgrt)
+pm = plot_model(fit_PCspgrt, type = "est", epred=TRUE, scale="response")
+pm + ylim(0.9, 1.1)
+```
+
+PC spaghetti report
+---------------
+```{r PC_spgtti_bayesian_report, echo=FALSE}
+# function to extract marginal means posteriors in response scale
+extract_pcspga_draws <- function(fit_PCspga) {
+  # pass model fit into emmeans to revert from linear predictor scale (logit or shifted_lognormal) to response scale (probabilities or RTs)
+	rg_fit <- ref_grid(
+		fit_PCspga,
+		epred = TRUE,# build reference grid using posterior_epred (response scale) for the 4x3 predictor combinations
+		at = list(sum_congruency = c(0, 1, 2, 3), PC_ordinal = c(-1, 0, 1)) 
+	)
+  # marginal means at the 4 values of sum_congruency : 3 values of PC_ordinal
+	em <- emmeans(                              
+		rg_fit,
+		specs = ~ sum_congruency * PC_ordinal,
+		type = "response"
+	)
+	print(summary(em))
+  # marginal means' distributions, draws extracted with tidybayes
+	draws <- gather_emmeans_draws(em)
+	groups <- c(MI = -1, Neu = 0, MC = 1)
+	out <- list()
+
+	for (group_name in names(groups)) {
+		for (sum_value in 0:3) {
+			out[[paste0(group_name, sum_value)]] <- draws %>%
+				filter(sum_congruency == sum_value, PC_ordinal == groups[[group_name]]) %>%
+				pull(.value)
+		}
+	}
+
+	out
+}
+
+print("Accuracy")
+# Accuracy
+bayestestR::describe_posterior(fit_PCspga)
+brms::hypothesis(fit_PCspga,"sum_congruency>0")
+brms::hypothesis(fit_PCspga,"PC_ordinal<0")
+brms::hypothesis(fit_PCspga,"sum_congruency:PC_ordinal>0")
+
+# get posterior draws of marginal means
+pcspga_draws <- as.data.frame(extract_pcspga_draws(fit_PCspga))
+
+# plot marginal means' distributions
+library(viridis)
+ggplot(pcspga_draws%>%
+    pivot_longer(1:12, names_to = "PC", values_to = "Accuracy") %>%
+    mutate(
+      PC_ordinal = sub("[0-3]$", "", PC),
+      cur_cong = sub("^(MI|Neu|MC)", "", PC),
+      PC_ordinal = factor(PC_ordinal, levels = c("MI", "Neu", "MC")),
+      cur_cong = factor(cur_cong, levels = c("0", "1", "2", "3"))
+    ),
+       aes(x = Accuracy, group = cur_cong, fill = cur_cong)) +
+  geom_density(adjust = 1.5, alpha=.4) + 
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  facet_grid(PC_ordinal ~ ., labeller = labeller(PC_ordinal = c("MI", "Neu", "MC"))) +
+  labs(tag="Proportion congruency", x = "Accuracy", y = "Density", fill = "Number of congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(-0.01, 0.82),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.y=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18),
+        plot.tag=element_text(angle=-90),
+        plot.margin = unit(c(0.5,1,0.5,1), "cm"),
+        plot.tag.position=c(1.02, 0.55),
+        axis.title.y = element_text(hjust = 0.4),
+        strip.text.y = element_text(size = 12))
+
+# reported contrasts
+PCacc.list <- with(pcspga_draws, list(
+  c("MI0", "MI3", "MC0", "MC3"),
+  c(mean(MI0), mean(MI3), mean(MC0), mean(MC3)),
+  rbind(hdi(MI0), hdi(MI3), hdi(MC0), hdi(MC3))
+))
+
+PCacc_contrast.list <- with(pcspga_draws, list(
+  c("MC0-MI0", "MC3-MI3", "MI0-MI3", "MC0-MC3"),
+  rbind(mean(MC0 - MI0), mean(MC3 - MI3), mean(MI0 - MI3), mean(MC0 - MC3)),
+  rbind(hdi(MC0 - MI0), hdi(MC3 - MI3), hdi(MI0 - MI3), hdi(MC0 - MC3))
+))
+
+################################################################################
+print("RT")
+# RT
+bayestestR::describe_posterior(fit_PCspgrt)
+brms::hypothesis(fit_PCspgrt,"sum_congruency<0")
+brms::hypothesis(fit_PCspgrt,"PC_ordinal>0")
+brms::hypothesis(fit_PCspgrt,"sum_congruency:PC_ordinal<0")
+
+
+# get posterior draws of marginal means
+pcspgrt_draws <- as.data.frame(extract_pcspga_draws(fit_PCspgrt))
+
+# plot marginal means' distributions
+library(viridis)
+ggplot(pcspgrt_draws %>%
+    pivot_longer(1:12, names_to = "PC", values_to = "RT") %>%
+    mutate(
+      PC_ordinal = sub("[0-3]$", "", PC),
+      cur_cong = sub("^(MI|Neu|MC)", "", PC),
+      PC_ordinal = factor(PC_ordinal, levels = c("MI", "Neu", "MC")),
+      cur_cong = factor(cur_cong, levels = c("0", "1", "2", "3"))
+    ),
+  aes(x = RT, group = cur_cong, fill = cur_cong)) +
+  geom_density(adjust = 1.5, alpha = .4) +
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  facet_grid(PC_ordinal ~ ., labeller = labeller(PC_ordinal = c("MI", "Neu", "MC"))) +
+  labs(tag="Proportion congruency", x = "Response time (ms)", y = "Density", fill = "Number of congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(-0.01, 0.82),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.y=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18),
+        plot.tag=element_text(angle=-90),
+        plot.margin = unit(c(0.5,1,0.5,1), "cm"),
+        plot.tag.position=c(1.02, 0.55),
+        axis.title.y = element_text(hjust = 0.4),
+        strip.text.y = element_text(size = 12))
+
+# reported contrasts
+PCrt.list <- with(pcspgrt_draws, list(
+  c("MI0", "MI3", "MC0", "MC3"),
+  c(mean(MI0), mean(MI3), mean(MC0), mean(MC3)),
+  rbind(hdi(MI0), hdi(MI3), hdi(MC0), hdi(MC3))
+))
+
+PCrt_contrast.list <- with(pcspgrt_draws, list(
+  c("MC0-MI0", "MC3-MI3", "MI0-MI3", "MC0-MC3"),
+  rbind(mean(MC0 - MI0), mean(MC3 - MI3), mean(MI0 - MI3), mean(MC0 - MC3)),
+  rbind(hdi(MC0 - MI0), hdi(MC3 - MI3), hdi(MI0 - MI3), hdi(MC0 - MC3))
+))
+
+
+
+# print results
+# accuracy
+PCacc.list
+PCacc_contrast.list
+
+#rt
+PCrt.list
+PCrt_contrast.list
+
+
+# report
+formatted_string <- sprintf("compared with trials in MI tasks, trials in MC tasks showed strong interference when current congruency was low, leading to longer RTs and lower accuracy (MC0-MI0 = %.0f ms, %.1f%%) and strong facilitation when current congruency was high (leading to shorter RTs and higher accuracy; MC3-MI3 = %.0f ms, %.1f%%).", 
+                            PCrt_contrast.list[[2]][1], PCacc_contrast.list[[2]][1]*100, PCrt_contrast.list[[2]][2], PCacc_contrast.list[[2]][2]*100)
+
+print(formatted_string)
+
+```
+PC adaptation by dimension 
+```{r PC_adaptation_byDimensions, echo=FALSE, message=FALSE}
+
+
+# separate adaptation effects by non-cued dimension
+PC_adpt_l = PC_adapt%>%
+  pivot_longer(adapt_rt_c:adapt_acc_p, names_to = "Adapting_dim", values_to = "PC_adaptation") %>% # long format - both RTs and ACC
+  mutate(Adapting_dim = factor(Adapting_dim),
+         outcome_var = substring(Adapting_dim, first=7, last=8),
+         Adapting_dim = substring(Adapting_dim, first=10, last=11)) 
+  ### tests
+  BFs_PCadpt_RT = matrix(data=NA,nrow=4,ncol=1)
+  bf_d1.RT = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="rt" & PC_adpt_l$Adapting_dim=="c"),]$PC_adaptation,
+                      nullInterval = c(0,Inf)) 
+  BFs_PCadpt_RT[1] = bf_d1.RT[2] # BF data | positive PC_adaptation / data | mu=0
+  bf_d2.RT = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="rt" & PC_adpt_l$Adapting_dim=="s"),]$PC_adaptation,
+                      nullInterval = c(0,Inf)) 
+  BFs_PCadpt_RT[2] = bf_d2.RT[2] # BF data | positive PC_adaptation / data | mu=0
+  bf_d3.RT = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="rt" & PC_adpt_l$Adapting_dim=="e"),]$PC_adaptation,
+                      nullInterval = c(0,Inf)) 
+  BFs_PCadpt_RT[3] = bf_d3.RT[2] # BF data | positive PC_adaptation / data | mu=0
+  bf_d4.RT = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="rt" & PC_adpt_l$Adapting_dim=="p"),]$PC_adaptation,
+                      nullInterval = c(0,Inf)) 
+  BFs_PCadpt_RT[4] = bf_d4.RT[2] # BF data | positive PC_adaptation / data | mu=0
+  BFs_PCadpt_acc = matrix(data=NA,nrow=4,ncol=1)
+  bf_d1.acc = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="ac" & PC_adpt_l$Adapting_dim=="_c"),]$PC_adaptation,
+                      nullInterval = c(-Inf,0)) 
+  BFs_PCadpt_acc[1] = bf_d1.acc[2] # BF data | positive PC_adaptation / data | mu=0
+  bf_d2.acc = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="ac" & PC_adpt_l$Adapting_dim=="_s"),]$PC_adaptation,
+                      nullInterval = c(-Inf,0)) 
+  BFs_PCadpt_acc[2] = bf_d2.acc[2] # BF data | positive PC_adaptation / data | mu=0
+  bf_d3.acc = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="ac" & PC_adpt_l$Adapting_dim=="_e"),]$PC_adaptation,
+                      nullInterval = c(-Inf,0)) 
+  BFs_PCadpt_acc[3] = bf_d3.acc[2] # BF data | positive PC_adaptation / data | mu=0
+  bf_d4.acc = ttestBF(x = PC_adpt_l[(PC_adpt_l$outcome_var=="ac" & PC_adpt_l$Adapting_dim=="_p"),]$PC_adaptation,
+                      nullInterval = c(-Inf,0)) 
+  BFs_PCadpt_acc[4] = bf_d4.acc[2] # BF data | positive PC_adaptation / data | mu=0
+  
+print("REPORT: PC adaptation effects by non-cued dimension")
+  print(paste("BFs_PCadapt_RT:",BFs_PCadpt_RT))
+  print(paste("BFs_PCadapt_acc:",BFs_PCadpt_acc))
+  
+  
+# report 
+  
+formatted_string <- sprintf("we observed PC adaptation effects on reaction time for the dimensions Color, Shape, and Edge (color: Bayes Factor (BF) = %.1f, shape: BF = %.1f, edge: BF = %.1f), but not for Pattern (pattern: BF = %.1f). For accuracy, we found evidence for PC adaptation effects on Color and Shape (color: BF = %.1f, shape: BF = %.1f), but not on Edge and Pattern (edge: BF = %.1f, pattern: BF = %.1f)", 
+                            BFs_PCadpt_RT[1], BFs_PCadpt_RT[2], BFs_PCadpt_RT[3], BFs_PCadpt_RT[4],
+                            BFs_PCadpt_acc[1], BFs_PCadpt_acc[2], 
+                            BFs_PCadpt_acc[3], BFs_PCadpt_acc[4])
+
+print(formatted_string)  
+```  
+
+
+``` {r PC_spgtti_on_switch_trial_bayesian_stats, echo=FALSE}
+# Test whether proportion-congruency effects occur reactively on switch trials,
+# before control settings can be carried over within a task-repeat sequence.
+
+library(brms)
+theme_set(theme_default())
+
+# accuracy
+data = data_proc[data_proc$task_count==1,] %>% # include only switch trials
+  mutate(PC_ordinal = (((pc)*3)-1.5)*2) # scale to -1 0 1 (MI, Neu, MC)
+
+prior <- get_prior(correct ~ 1 + sum_congruency*PC_ordinal,
+                   family = bernoulli(link = "logit"),
+                   data = data)
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "PC_ordinal"),
+           set_prior("normal(0,3)", class = "b", coef = "sum_congruency:PC_ordinal"),
+           set_prior("student_t(3, 0, 2.5)", class = "Intercept")
+           )
+fit_PCspga_switchtrial <- brm(correct ~ 1 + sum_congruency*PC_ordinal + (1 + sum_congruency*PC_ordinal | subid), 
+             family = bernoulli(link = "logit"),
+             prior = prior,
+             data = data,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 4000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "PCspga_switchtrial")
+
+print(fit_PCspga_switchtrial, digits = 3)
+# pp_check(fit_PCspga_switchtrial)
+plot(fit_PCspga_switchtrial, ask = FALSE)
+# summary(fit_PCspga_switchtrial)
+pm = plot_model(fit_PCspga_switchtrial, type = "est", epred=TRUE, scale="response")
+pm + ylim(0.5, 2.4)
+
+
+
+# response time
+data_correct = data_proc[data_proc$correct==1,] # for predicting RTs, drop incorrect trials
+data_correct = data_correct[data_correct$task_count==1,] %>% # include only switch trials
+                mutate(PC_ordinal = (((pc)*3)-1.5)*2) # scale to -1 0 1 (MI, Neu, MC)
+
+
+prior <- get_prior(rt ~ 1 + sum_congruency*PC_ordinal,
+                   family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+                   data = data_correct)
+
+prior <- c(set_prior("normal(0,3)", class = "b", coef = "sum_congruency"),
+           set_prior("normal(0,3)", class = "b", coef = "PC_ordinal"),
+           set_prior("normal(0,3)", class = "b", coef = "sum_congruency:PC_ordinal"),
+           set_prior("student_t(3, 6.5, 2.5)", class = "Intercept"),
+           set_prior("uniform(0, min_Y)", class = "ndt", lb="0", ub="min_Y"),
+           set_prior("student_t(3, 0, 2.5)", class = "sigma", lb="0")
+           )
+
+
+fit_PCspgrt_switchtrial <- brm(rt ~ 1 + sum_congruency*PC_ordinal + (1 + sum_congruency*PC_ordinal | subid),
+             family = shifted_lognormal(link = "identity", link_sigma = "log", link_ndt = "log"),
+             prior = prior,
+             data = data_correct,
+             cores = 8,
+             # control = list(adapt_delta = 0.99),
+             chains = 4,
+             warmup = 2000,
+             iter = 4000,
+             sample_prior = TRUE,
+             save_pars = save_pars(all = TRUE),
+             file = "PCspgrt_switchtrial")
+
+
+
+print(fit_PCspgrt_switchtrial, digits = 3)
+# pp_check(fit_PCspgrt_switchtrial)
+plot(fit_PCspgrt_switchtrial, ask = FALSE)
+# summary(fit_PCspgrt_switchtrial)
+pm = plot_model(fit_PCspgrt_switchtrial, type = "est", epred=TRUE, scale="response")
+pm + ylim(0.9, 1.1)
+```
+PC on SWITCH TRIAL spaghetti report
+---------------
+```{r PC_spgtti_on_switch_trial_bayesian_report, echo=FALSE}
+
+print("Accuracy - PC on switch trials")
+# Accuracy
+bayestestR::describe_posterior(fit_PCspga_switchtrial)
+brms::hypothesis(fit_PCspga_switchtrial,"sum_congruency>0")
+brms::hypothesis(fit_PCspga_switchtrial,"PC_ordinal<0")
+brms::hypothesis(fit_PCspga_switchtrial,"sum_congruency:PC_ordinal>0")
+
+# get posterior draws of marginal means
+pcspga_draws <- as.data.frame(extract_pcspga_draws(fit_PCspga_switchtrial))# note: replacing value in same df as for previous PC spaghetti (on all trials)
+
+# plot marginal means' distributions
+library(viridis)
+ggplot(pcspga_draws%>%
+    pivot_longer(1:12, names_to = "PC", values_to = "Accuracy") %>%
+    mutate(
+      PC_ordinal = sub("[0-3]$", "", PC),
+      cur_cong = sub("^(MI|Neu|MC)", "", PC),
+      PC_ordinal = factor(PC_ordinal, levels = c("MI", "Neu", "MC")),
+      cur_cong = factor(cur_cong, levels = c("0", "1", "2", "3"))
+    ),
+       aes(x = Accuracy, group = cur_cong, fill = cur_cong)) +
+  geom_density(adjust = 1.5, alpha=.4) + 
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  facet_grid(PC_ordinal ~ ., labeller = labeller(PC_ordinal = c("MI", "Neu", "MC"))) +
+  labs(tag="Proportion congruency on switch trials", x = "Accuracy", y = "Density", fill = "Number of congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(-0.01, 0.82),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.y=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18),
+        plot.tag=element_text(angle=-90),
+        plot.margin = unit(c(0.5,1,0.5,1), "cm"),
+        plot.tag.position=c(1.02, 0.55),
+        axis.title.y = element_text(hjust = 0.4),
+        strip.text.y = element_text(size = 12))
+
+# reported contrasts
+switch_PCacc.list <- with(pcspga_draws, list(
+  c("MI0", "MI3", "MC0", "MC3"),
+  c(mean(MI0), mean(MI3), mean(MC0), mean(MC3)),
+  rbind(hdi(MI0), hdi(MI3), hdi(MC0), hdi(MC3))
+))
+
+switch_PCacc_contrast.list <- with(pcspga_draws, list(
+  c("MC0-MI0", "MC3-MI3", "MI0-MI3", "MC0-MC3"),
+  rbind(mean(MC0 - MI0), mean(MC3 - MI3), mean(MI0 - MI3), mean(MC0 - MC3)),
+  rbind(hdi(MC0 - MI0), hdi(MC3 - MI3), hdi(MI0 - MI3), hdi(MC0 - MC3))
+))
+
+################################################################################
+print("RT - PC on switch trials")
+# RT
+bayestestR::describe_posterior(fit_PCspgrt_switchtrial)
+brms::hypothesis(fit_PCspgrt_switchtrial,"sum_congruency<0")
+brms::hypothesis(fit_PCspgrt_switchtrial,"PC_ordinal>0")
+brms::hypothesis(fit_PCspgrt_switchtrial,"sum_congruency:PC_ordinal<0")
+
+
+# get posterior draws of marginal means
+pcspgrt_draws <- as.data.frame(extract_pcspga_draws(fit_PCspgrt_switchtrial))# note: replacing value in same df as for previous PC spaghetti (on all trials)
+
+# plot marginal means' distributions
+library(viridis)
+ggplot(pcspgrt_draws %>%
+    pivot_longer(1:12, names_to = "PC", values_to = "RT") %>%
+    mutate(
+      PC_ordinal = sub("[0-3]$", "", PC),
+      cur_cong = sub("^(MI|Neu|MC)", "", PC),
+      PC_ordinal = factor(PC_ordinal, levels = c("MI", "Neu", "MC")),
+      cur_cong = factor(cur_cong, levels = c("0", "1", "2", "3"))
+    ),
+  aes(x = RT, group = cur_cong, fill = cur_cong)) +
+  geom_density(adjust = 1.5, alpha = .4) +
+  scale_fill_viridis(discrete=TRUE, labels=c(0,1,2,3),
+                     begin = 0,
+                     end = 0.3,
+                     option="turbo") + 
+  scale_x_continuous(n.breaks=10) +
+  facet_grid(PC_ordinal ~ ., labeller = labeller(PC_ordinal = c("MI", "Neu", "MC"))) +
+  labs(tag="Proportion congruency on switch trial", x = "Response time (ms)", y = "Density", fill = "Number of congruent\ndimensions") + 
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.position = c(-0.01, 0.82),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        axis.text.y=element_blank(),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 18),
+        plot.tag=element_text(angle=-90),
+        plot.margin = unit(c(0.5,1,0.5,1), "cm"),
+        plot.tag.position=c(1.02, 0.55),
+        axis.title.y = element_text(hjust = 0.4),
+        strip.text.y = element_text(size = 12))
+
+# reported contrasts
+switch_PCrt.list <- with(pcspgrt_draws, list(
+  c("MI0", "MI3", "MC0", "MC3"),
+  c(mean(MI0), mean(MI3), mean(MC0), mean(MC3)),
+  rbind(hdi(MI0), hdi(MI3), hdi(MC0), hdi(MC3))
+))
+
+switch_PCrt_contrast.list <- with(pcspgrt_draws, list(
+  c("MC0-MI0", "MC3-MI3", "MI0-MI3", "MC0-MC3"),
+  rbind(mean(MC0 - MI0), mean(MC3 - MI3), mean(MI0 - MI3), mean(MC0 - MC3)),
+  rbind(hdi(MC0 - MI0), hdi(MC3 - MI3), hdi(MI0 - MI3), hdi(MC0 - MC3))
+))
+
+
+
+# print results
+# accuracy
+switch_PCacc.list
+switch_PCacc_contrast.list
+
+#rt
+switch_PCrt.list
+switch_PCrt_contrast.list
+
+
+# report
+formatted_string <- sprintf("compared with trials in MI tasks, trials in MC tasks showed strong interference when current congruency was low, leading to longer RTs and lower accuracy (MC0-MI0 = %.0f ms, %.1f%%) and strong facilitation when current congruency was high (leading to shorter RTs and higher accuracy; MC3-MI3 = %.0f ms, %.1f%%).", 
+                            switch_PCrt_contrast.list[[2]][1], switch_PCacc_contrast.list[[2]][1]*100, switch_PCrt_contrast.list[[2]][2], switch_PCacc_contrast.list[[2]][2]*100)
+
+print(formatted_string)
+
+```
+
+
+
+
+Distributional analyses
+---------------
+``` {r delta_plots, echo=FALSE, eval=FALSE}
+
+n_bins = 8
+theme_set(theme_classic())
+library(RColorBrewer) # Load the RColorBrewer for color palettes
+palette <- brewer.pal(9, "Blues") 
+dark_blues <- palette[6:9]
+palette <- brewer.pal(9, "Oranges") 
+dark_oranges <- palette[6:9]
+
+source(paste(helper_functions_path,"distributional_analysis_functions.R",sep=""))
+
+data = data_proc[data_proc$task_count>1,] # drop switch trials
+
+data$congruency_color[data$task_n==0] = NaN # NaN if dimension was cued (replace -1)
+data$congruency_shape[data$task_n==1] =  NaN
+data$congruency_edge[data$task_n==2] = NaN
+data$congruency_pattern[data$task_n==3] = NaN
+data$congruency_color = as.factor(data$congruency_color)
+data$congruency_shape = as.factor(data$congruency_shape)
+data$congruency_edge = as.factor(data$congruency_edge)
+data$congruency_pattern = as.factor(data$congruency_pattern)
+# Prepare variables used by the delta-delta analyses.
+data$prev_0_congruent[data$prev_0_congruent == -1] = NaN # NaN if dimension was cued (replace -1)
+data$prev_1_congruent[data$prev_1_congruent == -1] = NaN
+data$prev_2_congruent[data$prev_2_congruent == -1] = NaN
+data$prev_3_congruent[data$prev_3_congruent == -1] = NaN
+data$prev_0_congruent = as.factor(data$prev_0_congruent)
+data$prev_1_congruent = as.factor(data$prev_1_congruent)
+data$prev_2_congruent = as.factor(data$prev_2_congruent)
+data$prev_3_congruent = as.factor(data$prev_3_congruent)
+
+data = ungroup(data)
+
+rt_data = data[data$correct==1,] # drop incorrect trials  
+
+
+# Conditional accuracy function: delta plots for each non-cued dimension separately
+delta_acc_data_eachNC <- process_all_dimensions(data, n_bins, Labels)
+# plot delta accuracy over RT quantiles, for each non-cued dimension congruency effect separately
+s9 = delta_acc_data_eachNC %>% 
+  mutate(avg_quantile_RT = round(avg_quantile_RT)) %>% 
+  summarySEwithin(measurevar="delta_acc", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","non_cued_dimension"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_quantile_RT = as.numeric(as.character(avg_quantile_RT)))  %>%
+  ggplot(aes(x = avg_quantile_RT, y=delta_acc, group = non_cued_dimension, color = non_cued_dimension)) +
+  geom_errorbar(aes(ymin=delta_acc-se, ymax=delta_acc+se), width=.18, size=0.8) +
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path") +
+  labs(title = "Accuracy Delta Plot", 
+       x = "Reaction time (ms)", y = expression(Delta*" Accuracy (%)")) + 
+  scale_color_viridis(discrete = T, name = "Interfering\ndimension") + 
+  theme(axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10)
+# ggsave(plot = s9, width = 10, height = 4, dpi = 300, filename = "s9.pdf")
+s9
+
+# RT distributional analysis of interference on RT: delta plots for each non-cued dimension separately
+delta_rt_data_eachNC <- process_all_dimensions(rt_data, n_bins, Labels)
+# plot delta RT over RT quantiles, for each non-cued dimension congruency effect separately
+s10 = delta_rt_data_eachNC %>%
+  mutate(avg_quantile_RT = round(avg_quantile_RT)) %>% 
+  summarySEwithin(measurevar="delta_rt", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","non_cued_dimension"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_quantile_RT = as.numeric(as.character(avg_quantile_RT)))  %>%
+  ggplot(aes(x = avg_quantile_RT, y=delta_rt, group = non_cued_dimension, color = non_cued_dimension)) +
+  geom_errorbar(aes(ymin=delta_rt-se, ymax=delta_rt+se), width=.18, size=0.8) +
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path") +
+  labs(title = "Reaction time Delta Plot", 
+              x = "Reaction time (ms)", y = expression(Delta*" Reaction time (ms)")) + 
+  scale_color_viridis(discrete = T, name = "Interfering\ndimension") + 
+  theme(axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10)
+# ggsave(plot = s10, width = 10, height = 4, dpi = 300, filename = "s10.pdf")
+s10
+  
+
+
+
+
+
+
+
+# Accuracy over RT quantiles and Conditional accuracy functions (CAF) 
+# (accuracy varies as a function of reaction time, conditional on task conditions)
+# Average across non-cued dimension (condition is sum_congruency)
+sumcon_acc_lists <- process_sumcongruency(data, n_bins)
+
+means_acc_sumcon = sumcon_acc_lists$means 
+# Conditional accuracy function - plot accuracy over RT quantiles - here x axis quantiles are computed within sum_congruency (NOT average across sum_congruency)
+s11 = means_acc_sumcon %>%
+  mutate(avg_cng_quantile_RT = round(avg_cng_quantile_RT)) %>% 
+  summarySEwithin(measurevar="accuracy", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","congruency","avg_cng_quantile_RT"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_cng_quantile_RT = as.numeric(as.character(avg_cng_quantile_RT)))  %>%
+  ggplot(aes(x = avg_cng_quantile_RT, y=accuracy, group=congruency, color=congruency)) +   # congruency == sum_congruency
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path", aes(group = congruency, color = congruency), na.rm = TRUE) +
+  geom_errorbar(aes(ymin=accuracy-se, ymax=accuracy+se), width=.18, size=0.8) +
+  scale_color_manual(values = dark_oranges, name = "# Congruent dimensions") +
+  labs(title = "Conditional accuracy function", x = "Reaction time (ms)", y = "Accuracy (%)") + 
+  theme(legend.position = c(0.50, 0.10),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10) +
+  scale_y_continuous(n.breaks = 7, limits = c(80, 100), expand = c(0, 0)) +
+  guides(color = guide_legend(nrow = 1))
+# ggsave(plot = s11, width = 6, height = 5, dpi = 300, filename = "s11.pdf")
+s11
+
+delta_acc_data_sumcon = sumcon_acc_lists$delta %>%
+  pivot_longer(delta_acc_03:delta_acc_01, names_to = "contrast", values_to = "delta_acc") # long format
+# plot delta accuracy over RT quantiles - because plotting contrasts, here x axis quantiles are computed across sum_congruency levels
+s12 = delta_acc_data_sumcon %>% 
+  mutate(avg_quantile_RT = round(avg_quantile_RT)) %>% 
+  summarySEwithin(measurevar="delta_acc", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","contrast"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_quantile_RT = as.numeric(as.character(avg_quantile_RT)))  %>%
+  ggplot(aes(x = avg_quantile_RT, y=delta_acc, group = contrast, linetype = contrast)) +
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path") +
+  geom_errorbar(aes(ymin=delta_acc-se, ymax=delta_acc+se), width=.18, size=0.8) +
+  labs(title = "Accuracy Delta Plot", x = "Reaction time (ms)",  y = expression(Delta*" Accuracy (%)")) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted"), name = "Contrast of\ncongruency\nlevels", labels = c("0-1", "0-2", "0-3")) +
+  theme(axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10) 
+# ggsave(plot = s12, width = 6, height = 5, dpi = 300, filename = "s12.pdf")
+s12
+
+
+
+# RT over RT quantiles and Delta Plots
+sumcon_rt_lists <- process_sumcongruency(rt_data, n_bins)
+
+means_rt_sumcon = sumcon_rt_lists$means 
+# Cumulative distribution 
+s13 = means_rt_sumcon %>%
+  summarySEwithin(measurevar="mean_rt", 
+                                        withinvars=c("RT_quantile","congruency"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(RT_quantile = as.integer(RT_quantile))  %>%
+  ggplot(aes(x = mean_rt, y=RT_quantile, group=congruency, color=congruency)) +   # congruency == sum_congruency
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path", na.rm = TRUE) +
+  geom_errorbar(aes(xmin=mean_rt-se, xmax=mean_rt+se), width=.18, size=0.8) +
+  scale_color_manual(values = dark_blues, name = "# Congruent dimensions") +
+  labs(title = "Reaction time distribution", x = "Reaction time (ms)", y = "Cumulative distribution") + 
+  theme(legend.position = c(0.50, 0.10),
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_y_continuous(labels = NULL) +
+  guides(color = guide_legend(nrow = 1))
+# ggsave(plot = s13, width = 6, height = 5, dpi = 300, filename = "s13.pdf")
+s13
+
+
+delta_rt_data_sumcon = sumcon_rt_lists$delta %>%
+  pivot_longer(delta_rt_03:delta_rt_01, names_to = "contrast", values_to = "delta_rt") # long format
+# plot delta RT over quantiles
+s14 = delta_rt_data_sumcon %>% 
+  mutate(avg_quantile_RT = round(avg_quantile_RT)) %>% 
+  summarySEwithin(measurevar="delta_rt", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","contrast"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_quantile_RT = as.numeric(as.character(avg_quantile_RT)))  %>%
+  ggplot(aes(x = avg_quantile_RT, y=delta_rt, group = contrast, linetype = contrast)) +
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path") +
+  geom_errorbar(aes(ymin=delta_rt-se, ymax=delta_rt+se), width=.18, size=0.8) +
+  labs(title = "Reaction time Delta Plot", x = "Reaction time (ms)", y = expression(Delta*" Reaction time (ms)")) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted"), name = "Contrast of\ncongruency\nlevels", labels = c("0-1", "0-2", "0-3")) +
+  theme(axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10)
+# ggsave(plot = s14, width = 6, height = 5, dpi = 300, filename = "s14.pdf")
+s14
+
+
+
+
+# Delta-delta plots: contrast interference functions after congruent versus
+# incongruent trials.
+# Conditional accuracy function: DELTA-DELTA plots for each non-cued dimension separately
+deltadelta_acc_data_eachNC <- deltadelta_all_dimensions(data, n_bins, Labels)
+# plot DELTA-DELTA accuracy over RT quantiles, for each non-cued dimension congruency effect separately
+s15 = deltadelta_acc_data_eachNC %>% 
+  mutate(avg_quantile_RT = round(avg_quantile_RT)) %>% 
+  summarySEwithin(measurevar="ddelta_acc", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","non_cued_dimension"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_quantile_RT = as.numeric(as.character(avg_quantile_RT)))  %>%
+  ggplot(aes(x = avg_quantile_RT, y=ddelta_acc, group = non_cued_dimension, color = non_cued_dimension)) +
+  geom_errorbar(aes(ymin=ddelta_acc-se, ymax=ddelta_acc+se), width=.18, size=0.8) +
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path") +
+  geom_hline(yintercept=0, linetype="dashed", color = "grey") +
+  labs(title = "Accuracy Delta-Delta Plot", 
+       x = "Reaction time (ms)", y = expression(Delta*Delta*" Accuracy (%)")) + 
+  scale_color_viridis(discrete = T, name = "Interfering\ndimension") + 
+  # scale_y_continuous(limits = c(-20, 8)) +
+  theme(axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10)
+# ggsave(plot = s15, width = 10, height = 4, dpi = 300, filename = "s15.pdf")
+s15
+
+# RT distributional analysis of interference on RT: DELTA-DELTA plots for each non-cued dimension separately
+deltadelta_rt_data_eachNC <- deltadelta_all_dimensions(rt_data, n_bins, Labels)
+# plot DELTA-DELTA RT over RT quantiles, for each non-cued dimension congruency effect separately
+s16 = deltadelta_rt_data_eachNC %>%
+  mutate(avg_quantile_RT = round(avg_quantile_RT)) %>%
+  summarySEwithin(measurevar="ddelta_rt", 
+                                        withinvars=c("RT_quantile","avg_quantile_RT","non_cued_dimension"), 
+                                        idvar="subid", na.rm=FALSE, conf.interval=.95) %>%
+  mutate(avg_quantile_RT = as.numeric(as.character(avg_quantile_RT)))  %>%
+  ggplot(aes(x = avg_quantile_RT, y=ddelta_rt, group = non_cued_dimension, color = non_cued_dimension)) +
+  geom_errorbar(aes(ymin=ddelta_rt-se, ymax=ddelta_rt+se), width=.18, size=0.8) +
+  stat_summary(fun = 'mean', geom = "point", na.rm = TRUE) +
+  stat_summary(fun = 'mean', geom = "path") +
+  geom_hline(yintercept=0, linetype="dashed", color = "grey") +
+  labs(title = "Reaction time Delta-Delta Plot", 
+              x = "Reaction time (ms)", y = expression(Delta*Delta*" Reaction time (ms)")) + 
+  scale_color_viridis(discrete = T, name = "Interfering\ndimension") + 
+  # scale_y_continuous(limits = c(-20, 40)) +
+  theme(axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13),
+        plot.title = element_text(size = 15)) + 
+  scale_x_continuous(n.breaks = 10)
+# ggsave(plot = s16, width = 10, height = 4, dpi = 300, filename = "s16.pdf")
+s16
+```
+
+
